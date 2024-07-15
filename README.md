@@ -30,6 +30,3 @@ git clone https://github.com/ScattrdBlade/vencordo
 2. Unzip the downloaded ZIP file into the `userplugins` folder.
 3. Ensure it's structured as `src/userplugins/vencordo` or `src/userplugins/vencordo-main`
 5. Run `pnpm build` in the terminal (command prompt/CMD) and the plugin should be added.
-
-### Credits
-This is a completed and fixed version of [samu.lol](https://github.com/144reasons)'s test plugin.
