@@ -19,16 +19,16 @@ cd Vencord/src/userplugins
 ```
 then run
 ```js
-git clone https://github.com/ScattrdBlade/fileShare
+git clone https://github.com/ScattrdBlade/vencordo
 ```
-2. The plugin folder (`fileShare`) should now be in the `userplugins` folder.
-3. Ensure it's structured as `src/userplugins/fileShare`
+2. The plugin folder (`vencordo`) should now be in the `userplugins` folder.
+3. Ensure it's structured as `src/userplugins/vencordo`
 4. Run `pnpm build` and the plugin should be added.
 
 **MANUAL DOWNLOAD**
 1. Click the green `<> Code` button at the top right of the repository and select `Download ZIP`
 2. Unzip the downloaded ZIP file into the `userplugins` folder.
-3. Ensure it's structured as `src/userplugins/fileShare` or `src/userplugins/fileShare-main`
+3. Ensure it's structured as `src/userplugins/vencordo` or `src/userplugins/vencordo-main`
 5. Run `pnpm build` in the terminal (command prompt/CMD) and the plugin should be added.
 
 ### Credits
