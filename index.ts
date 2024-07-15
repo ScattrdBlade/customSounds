@@ -56,7 +56,7 @@ export default definePlugin({
     name: "Vencordo",
     description: 'Replace the "discordo" sound on startup with something a bit more interesting',
     authors: [
-        Devs.echo,
+        Devs.ScattrdBlade, Devs.echo,
     ],
     settings,
     patches: [
