@@ -7,25 +7,16 @@ This is a Vencord plugin that allows you to change the `Discordo`/`Dicodo` start
 You can find audio URLs on soundboard sites, or create your own GitHub repository, add an audio file, and paste the raw link to it in the plugin's settings.
 
 ## DOWNLOAD INSTRUCTIONS
-You can either __clone__ the repository OR __manually download__ it as a zip file.<br/>
+You can either __clone__ the repository OR __manually install__ it by downloading it as a zip file.<br/>
 > [!WARNING]
-> Make sure you have the Vencord [developer build](https://github.com/Vendicated/Vencord/blob/main/docs/1_INSTALLING.md) installed.<br/>
+> Make sure you have the Vencord [developer build](https://docs.vencord.dev/installing/) installed.<br/>
+
+### CLONE INSTALLATION
+The cloning installation guide can be found [here](https://discord.com/channels/1015060230222131221/1257038407503446176/1257038407503446176) or via [the official Vencord Docs](https://docs.vencord.dev/installing/custom-plugins/).
+
+### MANUAL INSTALLATION
+> [!IMPORTANT]
 > Inside the `Vencord` folder should be a folder called `src`. If you haven't already, create a folder called `userplugins` inside the `src` folder.
-
-**CLONING:**
-1. Open up the terminal (command prompt/CMD) and run
-```shell
-cd Vencord/src/userplugins
-```
-then run
-```js
-git clone https://github.com/ScattrdBlade/vencordo
-```
-2. The plugin folder (`vencordo`) should now be in the `userplugins` folder.
-3. Ensure it's structured as `src/userplugins/vencordo`
-4. Run `pnpm build` and the plugin should be added.
-
-**MANUAL DOWNLOAD**
 1. Click the green `<> Code` button at the top right of the repository and select `Download ZIP`
 2. Unzip the downloaded ZIP file into the `userplugins` folder.
 3. Ensure it's structured as `src/userplugins/vencordo` or `src/userplugins/vencordo-main`
