@@ -106,19 +106,19 @@ const settings = definePluginSettings({
         restartNeeded: true
     },
     asmrMessage1URL: {
-        description: "Audio URL for asmr message1 sound",
+        description: "Audio URL for asmr message 1 sound",
         type: OptionType.STRING,
         default: "",
         restartNeeded: true
     },
     bitMessage1URL: {
-        description: "Audio URL for bit message1 sound",
+        description: "Audio URL for bit message 1 sound",
         type: OptionType.STRING,
         default: "",
         restartNeeded: true
     },
     bopMessage1URL: {
-        description: "Audio URL for bop message1 sound",
+        description: "Audio URL for bop message 1 sound",
         type: OptionType.STRING,
         default: "",
         restartNeeded: true
@@ -208,7 +208,7 @@ const settings = definePluginSettings({
         restartNeeded: true
     },
     duckyMessage1URL: {
-        description: "Audio URL for ducky message1 sound",
+        description: "Audio URL for ducky message 1 sound",
         type: OptionType.STRING,
         default: "",
         restartNeeded: true
@@ -238,37 +238,43 @@ const settings = definePluginSettings({
         restartNeeded: true
     },
     lofiMessage1URL: {
-        description: "Audio URL for lofi message1 sound",
+        description: "Audio URL for lofi message 1 sound",
         type: OptionType.STRING,
         default: "",
         restartNeeded: true
     },
     mention1URL: {
-        description: "Audio URL for mention1 sound",
+        description: "Audio URL for mention 1 sound",
         type: OptionType.STRING,
         default: "",
         restartNeeded: true
     },
     mention2URL: {
-        description: "Audio URL for mention2 sound",
+        description: "Audio URL for mention 2 sound",
         type: OptionType.STRING,
         default: "",
         restartNeeded: true
     },
     mention3URL: {
-        description: "Audio URL for mention3 sound",
+        description: "Audio URL for mention 3 sound",
+        type: OptionType.STRING,
+        default: "",
+        restartNeeded: true
+    },
+    message1DetuneURL: {
+        description: "Audio URL for message 1 sound",
         type: OptionType.STRING,
         default: "",
         restartNeeded: true
     },
     message2URL: {
-        description: "Audio URL for message2 sound",
+        description: "Audio URL for message 2 sound",
         type: OptionType.STRING,
         default: "",
         restartNeeded: true
     },
     message3URL: {
-        description: "Audio URL for message3 sound",
+        description: "Audio URL for message 3 sound",
         type: OptionType.STRING,
         default: "",
         restartNeeded: true
@@ -339,8 +345,62 @@ const settings = definePluginSettings({
         default: "",
         restartNeeded: true
     },
+    streamEndedDetuneURL: {
+        description: "Audio URL for stream ended sound",
+        type: OptionType.STRING,
+        default: "",
+        restartNeeded: true
+    },
+    streamStartedDetuneURL: {
+        description: "Audio URL for stream started sound",
+        type: OptionType.STRING,
+        default: "",
+        restartNeeded: true
+    },
+    streamUserJoinedDetuneURL: {
+        description: "Audio URL for stream user joined sound",
+        type: OptionType.STRING,
+        default: "",
+        restartNeeded: true
+    },
+    streamUserLeftDetuneURL: {
+        description: "Audio URL for stream user left sound",
+        type: OptionType.STRING,
+        default: "",
+        restartNeeded: true
+    },
     successURL: {
         description: "Audio URL for success sound",
+        type: OptionType.STRING,
+        default: "",
+        restartNeeded: true
+    },
+    undeafenDetuneURL: {
+        description: "Audio URL for undeafen sound",
+        type: OptionType.STRING,
+        default: "",
+        restartNeeded: true
+    },
+    unmuteDetuneURL: {
+        description: "Audio URL for unmute sound",
+        type: OptionType.STRING,
+        default: "",
+        restartNeeded: true
+    },
+    userJoinDetuneURL: {
+        description: "Audio URL for user join sound",
+        type: OptionType.STRING,
+        default: "",
+        restartNeeded: true
+    },
+    userLeaveDetuneURL: {
+        description: "Audio URL for user leave sound",
+        type: OptionType.STRING,
+        default: "",
+        restartNeeded: true
+    },
+    userMovedDetuneURL: {
+        description: "Audio URL for user moved sound",
         type: OptionType.STRING,
         default: "",
         restartNeeded: true
@@ -387,7 +447,7 @@ function getSoundURL(settingKey: string) {
 
 export default definePlugin({
     name: "CustomSounds",
-    description: "Replace Discord sounds with a custom ones",
+    description: "Replace Discord sounds with custom ones",
     authors: [
         Devs.ScattrdBlade
     ],
