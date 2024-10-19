@@ -437,6 +437,14 @@ function getSoundURL(settingKey: string) {
         return url;
     };
 
+    if (!url) {
+        const defaultFiles = soundFileMapping[settingKey];
+        if (defaultFiles && defaultFiles.length > 0) {
+            return `https://discordapp.com/assets/${defaultFiles[0]}`;
+        }
+        return "";
+    }
+
     const correctedURL = addHttpsIfMissing(url);
 
     if (correctedURL && isValidURL(correctedURL) && hasValidExtension(correctedURL)) {
