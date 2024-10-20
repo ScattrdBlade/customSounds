@@ -437,14 +437,6 @@ function getSoundURL(settingKey: string) {
         return url;
     };
 
-    if (!url) {
-        const defaultFiles = soundFileMapping[settingKey];
-        if (defaultFiles && defaultFiles.length > 0) {
-            return `https://discordapp.com/assets/${defaultFiles[0]}`;
-        }
-        return "";
-    }
-
     const correctedURL = addHttpsIfMissing(url);
 
     if (correctedURL && isValidURL(correctedURL) && hasValidExtension(correctedURL)) {
@@ -465,7 +457,14 @@ export default definePlugin({
             find: file,
             replacement: {
                 match: /e\.exports\s*=\s*n\.p\s*\+\s*"[a-zA-Z0-9]+\.(mp3|wav|ogg|flac|aac|m4a)"/,
-                replace: () => `e.exports="${getSoundURL(settingKey)}"`
+                replace: () => {
+                    const soundURL = getSoundURL(settingKey);
+                    if (soundURL) {
+                        return `e.exports="${soundURL}"`;
+                    }
+                    // If no valid URL, return the original string without replacing
+                    return `e.exports=n.p+"${file}"`;
+                }
             }
         }))
     )
