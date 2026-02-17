@@ -371,7 +371,7 @@ const settings = definePluginSettings({
 
                 const exportPayload = {
                     overrides,
-                    __note: "Audio files are not included in exports and will need to be re-uploaded after import"
+                    __note: "Audio files are not included in exports and will need to be re-uploaded before import"
                 };
 
                 const blob = new Blob([JSON.stringify(exportPayload, null, 2)], { type: "application/json" });

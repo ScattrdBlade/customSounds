@@ -15,6 +15,8 @@ const DEFAULT_MAX_FILE_SIZE_MB = 15;
 // Configurable max file size (set by plugin settings)
 let maxFileSizeMB = DEFAULT_MAX_FILE_SIZE_MB;
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 export function setMaxFileSizeMB(sizeMB: number): void {
     maxFileSizeMB = sizeMB;
 }
@@ -65,6 +67,17 @@ export async function getAllAudio(): Promise<AudioStore> {
     return (await get(STORAGE_KEY)) ?? {};
 }
 
+async function getBufferHashString(buffer: ArrayBuffer): Promise<string> {
+    const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+
+    const hashView = new Uint8Array(hashBuffer);
+
+    const hashString = Array.from(hashView)
+        .map(b => b.toString(16).padStart(2, "0"))
+        .join("");
+    return hashString;
+}
+
 /**
  * Save an audio file with size validation
  */
@@ -76,8 +89,8 @@ export async function saveAudio(file: File): Promise<string> {
         throw new Error(`File too large (${fileMB}MB). Maximum size is ${maxFileSizeMB}MB.`);
     }
 
-    const id = crypto.randomUUID();
     const buffer = await file.arrayBuffer();
+    const id = await getBufferHashString(buffer);
     const dataUri = await generateDataURI(buffer, file.type, file.name);
 
     // Store the audio data (only dataUri, not buffer)
@@ -122,6 +135,12 @@ export async function deleteAudio(id: string): Promise<void> {
     }
 }
 
+
+function isUUIDLike(s: string): boolean {
+    return UUID_REGEX.test(s);
+}
+
+
 /**
  * Migrate old storage format to new format (run once on startup)
  */
@@ -134,7 +153,11 @@ export async function migrateStorage(): Promise<boolean> {
 
     // Check if any entries have the old 'buffer' field
     for (const file of Object.values(audioStore)) {
-        if (file && typeof file === "object" && "buffer" in file) {
+        if (!file) continue;
+        if (typeof file !== "object") continue;
+
+        if ("buffer" in file ||
+            ("id" in file && isUUIDLike(file.id))) {
             needsMigration = true;
             break;
         }
@@ -147,26 +170,29 @@ export async function migrateStorage(): Promise<boolean> {
     }
 
     if (needsMigration) {
-        console.log("[CustomSounds] Migrating storage to remove redundant buffers...");
+        console.log("[CustomSounds] Migrating storage to remove redundant buffers and fix IDs...");
         const newAudioStore: AudioStore = {};
 
-        for (const [id, file] of Object.entries(audioStore)) {
-            if (file && typeof file === "object") {
-                // If it has dataUri, keep it; if only buffer, generate dataUri
-                let { dataUri } = file;
-                if (!dataUri && file.buffer) {
-                    dataUri = await generateDataURI(file.buffer, file.type, file.name);
-                }
+        for (const [file] of Object.values(audioStore)) {
+            if (!file || typeof file !== "object") continue;
 
-                if (dataUri) {
-                    newAudioStore[id] = {
-                        id: file.id || id,
-                        name: file.name || "Unknown",
-                        type: file.type || "audio/mpeg",
-                        dataUri
-                    };
-                }
+            // If it has dataUri, keep it; if only buffer, generate dataUri
+            let { dataUri } = file;
+            if (!dataUri && file.buffer) {
+                dataUri = await generateDataURI(file.buffer, file.type, file.name);
             }
+
+            if (!dataUri) continue;
+
+            // Migrate from random UUIDs to file hashes to make imports actually useful
+            const new_id = await getBufferHashString(file.buffer);
+
+            newAudioStore[new_id] = {
+                id: new_id,
+                name: file.name || "Unknown",
+                type: file.type || "audio/mpeg",
+                dataUri
+            };
         }
 
         await set(STORAGE_KEY, newAudioStore);
