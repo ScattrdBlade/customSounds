@@ -18,13 +18,6 @@ export interface SoundOverride {
     selectedFileId?: string;
 }
 
-export interface SoundPlayer {
-    loop(): void;
-    play(): void;
-    pause(): void;
-    stop(): void;
-}
-
 export const seasonalSounds = {
     "halloween_call_calling": "https://canary.discord.com/assets/0950a7ea4f1dd037870b.mp3",
     "winter_call_calling": "https://canary.discord.com/assets/7b945e7be3f86c5b7c82.mp3",
@@ -85,12 +78,12 @@ export const soundTypes: readonly SoundType[] = [
     { name: "Highfive Whistle", id: "highfive_whistle" },
     { name: "Human Man", id: "human_man" },
     { name: "LoFi Message", id: "lofi_message1" },
-    { name: "Mention 1", id: "mention1" },
-    { name: "Mention 2", id: "mention2" },
-    { name: "Mention 3", id: "mention3" },
-    { name: "Message 1", id: "message1", seasonal: ["halloween_message1"] },
-    { name: "Message 2", id: "message2" },
-    { name: "Message 3", id: "message3" },
+    { name: "Mention 1 (@role)", id: "mention1" },
+    { name: "Mention 2 (@everyone)", id: "mention2" },
+    { name: "Mention 3 (@here)", id: "mention3" },
+    { name: "Message 1 (Generic)", id: "message1", seasonal: ["halloween_message1"] },
+    { name: "Message 2 (Reply in Server)", id: "message2" },
+    { name: "Message 3 (DMs and Group DMs)", id: "message3" },
     { name: "Mute", id: "mute", seasonal: ["halloween_mute", "winter_mute"] },
     { name: "Overlay Unlock", id: "overlayunlock" },
     { name: "Poggermode Achievement", id: "poggermode_achievement_unlock" },
