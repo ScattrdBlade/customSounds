@@ -1,4 +1,4 @@
-**UPDATE: Cleaner architecture with a streamlined audio store, simplified caching, and improved component structure.**
+**UPDATE: UPDATE: Max volume is now 500%, playback speed is customizable, and exports now include audio files.**
 
 > [!TIP]
 > **If you run into any issues, please let me know on [Discord](https://discord.gg/jHDJaW9Gyz)**
