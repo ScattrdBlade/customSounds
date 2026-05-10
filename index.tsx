@@ -15,10 +15,7 @@ import { useForceUpdater } from "@utils/react";
 import definePlugin, { makeRange, OptionType, StartAt } from "@utils/types";
 import { React, Select, showToast, Slider } from "@webpack/common";
 
-import {
-    AudioPlayer, dataUriCache, deleteAudio, ensureDataURICached, ExportedAudioFile,
-    getAllAudio, importAudio, playAudio, PreviewHandle, saveAudio, StoredAudioFile
-} from "./audio";
+import { AudioPlayer, dataUriCache, deleteAudio, ensureDataURICached, ExportedAudioFile, getAllAudio, getAudioMeta, importAudio, playAudio, PreviewHandle, saveAudio } from "./audio";
 import { makeEmptyOverride, SoundOverride, SoundType, soundTypes } from "./types";
 
 const cap = (s: string) => s.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
@@ -43,7 +40,7 @@ async function cacheCustom(id: string | undefined) {
 const soundSettings = Object.fromEntries(soundTypes.map(t => [t.id, { type: OptionType.STRING, description: `Override for ${t.name}`, default: JSON.stringify(makeEmptyOverride()), hidden: true }]));
 const settings = definePluginSettings({ ...soundSettings, overrides: { type: OptionType.COMPONENT, description: "", component: () => <SettingsUI /> } });
 
-function SoundCard({ type, override, files, onFilesChange, onChange }: { type: SoundType; override: SoundOverride; files: Record<string, StoredAudioFile>; onFilesChange: () => Promise<void>; onChange: () => Promise<void>; }) {
+function SoundCard({ type, override, files, onFilesChange, onChange }: { type: SoundType; override: SoundOverride; files: Record<string, string>; onFilesChange: () => Promise<void>; onChange: () => Promise<void>; }) {
     const fileInputRef = React.useRef<HTMLInputElement>(null);
     const update = useForceUpdater();
     const sound = React.useRef<PreviewHandle | null>(null);
@@ -89,7 +86,7 @@ function SoundCard({ type, override, files, onFilesChange, onChange }: { type: S
         } catch (e) { console.error("[CustomSounds] Delete failed:", e); showToast("Delete failed"); }
     };
 
-    const fileOpts = Object.entries(files).filter(([id, f]) => !!id && !!f?.name).map(([id, f]) => ({ value: id, label: f.name }));
+    const fileOpts = Object.entries(files).filter(([id, name]) => !!id && !!name).map(([id, name]) => ({ value: id, label: name }));
     const sourceOpts = [{ value: "default", label: "Default" }, ...Object.keys(type.seasonal ?? {}).map(id => ({ value: id, label: cap(id) })), { value: "custom", label: "Custom" }];
 
     return (
@@ -121,11 +118,11 @@ function SoundCard({ type, override, files, onFilesChange, onChange }: { type: S
 
 function SettingsUI() {
     const [resetTrigger, setResetTrigger] = React.useState(0);
-    const [files, setFiles] = React.useState<Record<string, StoredAudioFile>>({});
+    const [files, setFiles] = React.useState<Record<string, string>>({});
     const fileInputRef = React.useRef<HTMLInputElement>(null);
 
     const loadFiles = React.useCallback(async () => {
-        try { setFiles(await getAllAudio()); } catch (e) { console.error("[CustomSounds]", e); }
+        try { setFiles(await getAudioMeta()); } catch (e) { console.error("[CustomSounds]", e); }
     }, []);
 
     React.useEffect(() => {

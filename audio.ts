@@ -75,6 +75,13 @@ export async function getAllAudio(): Promise<Record<string, StoredAudioFile>> {
     return (await get(KEY)) ?? {};
 }
 
+export async function getAudioMeta(): Promise<Record<string, string>> {
+    const all = await getAllAudio();
+    const meta: Record<string, string> = {};
+    for (const [id, f] of Object.entries(all)) meta[id] = f.name;
+    return meta;
+}
+
 export async function saveAudio(file: File): Promise<string> {
     const buffer = await file.arrayBuffer();
     const id = await hashBuffer(buffer);
