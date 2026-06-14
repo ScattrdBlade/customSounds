@@ -208,9 +208,9 @@ export default definePlugin({
             find: "could not play audio",
             group: true,
             replacement: [
-                { match: /(let \i=class.{0,900}?new Audio;\i.src=)((\i\(\d+\))(?:\(`\.\/\$\{|.{0,50}concat\())this.name((?:\}\.mp3`|,".mp3"\))\))/, replace: '$3;$1this.type!=="discord"?this.audio:$2this.audio$4' },
+                { match: /(let \i=class.{0,1000}?new Audio;\i.src=)((\i\(\d+\))(?:\(`\.\/\$\{|.{0,50}concat\())this.name((?:\}\.mp3`|,".mp3"\))\))/, replace: '$3;$1this.type!=="discord"?this.audio:$2this.audio$4' },
                 { match: /(new Audio;)(\i)(\.src=)/, replace: '$1$2.crossOrigin="anonymous";$2$3' },
-                { match: /(?<=constructor\((\i,\i,\i,\i)).{0,200}outputChannel=\i/, replace: ",options){$self.buildPlayer(this,$1,options);" },
+                { match: /(?<=constructor\((\i,\i,\i,\i,\i)).{0,200}trackNotificationFailure=\i/, replace: ",options){$self.buildPlayer(this,$1,options);" },
                 { match: /(\i.pause\(\),(\i).src="".{0,20}?null)/, replace: "$2.onerror=()=>{},$1" },
                 { match: /(?<=(\i).onloadeddata=\(\)=>{)/, replace: "$self.applyBoost(this,$1)," }
             ]
@@ -225,7 +225,7 @@ export default definePlugin({
         }
     ],
 
-    buildPlayer(player: AudioPlayer, audio: string, _u: any, internalVolume: number, channel: string, options: any = {}) {
+    buildPlayer(player: AudioPlayer, audio: string, _u: any, internalVolume: number, channel: string, trackNotificationFailure: boolean, options: any = {}) {
         const v = Math.max(0, internalVolume || (options.volume ? options.volume / 100 : 1));
         player.preprocessDataOriginal = { audio, volume: v };
         player.audio = audio;
@@ -233,6 +233,7 @@ export default definePlugin({
         player._volume = Math.min(1, v);
         player.type = audioType(audio);
         (player as any).outputChannel = channel;
+        (player as any).trackNotificationFailure = trackNotificationFailure;
         (player as any).preload = false;
         (player as any).persistent = false;
         player.processAudio = () => this.processAudio(player);
