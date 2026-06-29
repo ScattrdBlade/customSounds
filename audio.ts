@@ -10,40 +10,29 @@ import { findByCodeLazy } from "@webpack";
 const KEY = "ScattrdCustomSounds";
 const AudioPlayerCtor = findByCodeLazy("could not play audio");
 
-export interface PreprocessAudioData { audio: string; volume: number; }
+export interface PreprocessAudioData { audio: string; volume: number; speed: number; type: string; }
+export interface PreviewHandle { stop(): void; volume: number; }
+export interface StoredAudioFile { id: string; name: string; type: string; buffer: ArrayBuffer; dataUri: string; }
+export interface ExportedAudioFile { id: string; name: string; type: string; dataUri: string; }
 
 export interface AudioPlayer {
-    preprocessDataOriginal: PreprocessAudioData;
-    preprocessDataCurrent: PreprocessAudioData;
-    audio: string;
-    _audio: null | Promise<HTMLAudioElement>;
-    _volume: number;
-    type: string;
-    processAudio(): void;
-    destroyAudio(): void;
-    play(): void;
-    stop(): void;
+    preprocessDataOriginal: PreprocessAudioData; preprocessDataCurrent: PreprocessAudioData; preprocessDataPrevious: PreprocessAudioData | null;
+    audio: string; _audio: null | Promise<HTMLAudioElement>; _volume: number; _speed: number; type: string;
+    persistent: boolean; preload: boolean; outputChannel: string; onEnded?: () => void; onError?: (error: any) => void;
+    processAudio(): void; destroyAudio(): void; ensureAudio(): Promise<HTMLAudioElement>; play(): void; stop(): void;
 }
 
-export interface PreviewHandle { stop(): void; volume: number; }
+export const dataUriCache = new Map<string, string>();
 
 export function playAudio(audio: string, opts: { volume?: number; } = {}): PreviewHandle {
-    const p: AudioPlayer = new AudioPlayerCtor(audio, null, null, "default", opts);
+    const p: AudioPlayer = new AudioPlayerCtor(opts, audio, null, null, "default");
     p.play();
     return {
         stop: () => p.stop(),
         get volume() { return p._volume * 100; },
-        set volume(v: number) {
-            p.preprocessDataOriginal.volume = Math.max(0, v / 100);
-            p.processAudio();
-        }
+        set volume(v: number) { p.preprocessDataOriginal.volume = Math.max(0, v / 100); p.processAudio(); }
     };
 }
-
-export interface StoredAudioFile { id: string; name: string; type: string; buffer: ArrayBuffer; dataUri: string; }
-export interface ExportedAudioFile { id: string; name: string; type: string; dataUri: string; }
-
-export const dataUriCache = new Map<string, string>();
 
 async function hashBuffer(buffer: ArrayBuffer): Promise<string> {
     const digest = await crypto.subtle.digest("SHA-256", buffer);
@@ -76,9 +65,8 @@ export async function getAllAudio(): Promise<Record<string, StoredAudioFile>> {
 }
 
 export async function getAudioMeta(): Promise<Record<string, string>> {
-    const all = await getAllAudio();
     const meta: Record<string, string> = {};
-    for (const [id, f] of Object.entries(all)) meta[id] = f.name;
+    for (const [id, f] of Object.entries(await getAllAudio())) meta[id] = f.name;
     return meta;
 }
 

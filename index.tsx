@@ -15,13 +15,42 @@ import { useForceUpdater } from "@utils/react";
 import definePlugin, { makeRange, OptionType, StartAt } from "@utils/types";
 import { React, Select, showToast, Slider } from "@webpack/common";
 
-import { AudioPlayer, dataUriCache, deleteAudio, ensureDataURICached, ExportedAudioFile, getAllAudio, getAudioMeta, importAudio, playAudio, PreviewHandle, saveAudio } from "./audio";
+import { AudioPlayer, dataUriCache, deleteAudio, ensureDataURICached, ExportedAudioFile, getAllAudio, getAudioMeta, importAudio, playAudio as playSound, PreviewHandle, saveAudio } from "./audio";
 import { makeEmptyOverride, SoundOverride, SoundType, soundTypes } from "./types";
 
 const cap = (s: string) => s.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
 const audioType = (a: string) => a.startsWith("data:") || a.startsWith("http") || a.startsWith("blob:") ? "url" : "discord";
 const seasonalUrls: Record<string, string> = Object.fromEntries(soundTypes.flatMap(t => t.seasonal ? Object.entries(t.seasonal) : []));
 let audioCtx: AudioContext | null = null;
+
+// Per-element Web Audio gain for volume >100%; tracked so the graph is reused (createMediaElementSource throws if called twice), updated on volume change, and disconnected on teardown.
+const boostNodes = new WeakMap<HTMLAudioElement, { source: MediaElementAudioSourceNode; gain: GainNode; }>();
+
+function setBoost(audio: HTMLAudioElement, volume: number) {
+    const factor = Math.max(1, volume);
+    if (factor <= 1.001 && !boostNodes.has(audio)) return;
+    try { audioCtx ??= new AudioContext(); } catch { return; }
+    if (audioCtx.state === "suspended") audioCtx.resume().catch(() => { });
+    let nodes = boostNodes.get(audio);
+    if (!nodes) {
+        try {
+            const source = audioCtx.createMediaElementSource(audio);
+            const gain = audioCtx.createGain();
+            source.connect(gain);
+            gain.connect(audioCtx.destination);
+            nodes = { source, gain };
+            boostNodes.set(audio, nodes);
+        } catch (e) { console.error("[CustomSounds] Web Audio attach failed:", e); return; }
+    }
+    nodes.gain.gain.value = factor;
+}
+
+function clearBoost(audio: HTMLAudioElement) {
+    const nodes = boostNodes.get(audio);
+    if (!nodes) return;
+    try { nodes.source.disconnect(); nodes.gain.disconnect(); } catch { }
+    boostNodes.delete(audio);
+}
 
 function getOverride(id: string): SoundOverride {
     const stored = settings.store[id];
@@ -48,13 +77,13 @@ function SoundCard({ type, override, files, onFilesChange, onChange }: { type: S
 
     const previewSound = async () => {
         sound.current?.stop();
-        if (!override.enabled) { sound.current = playAudio(type.id); return; }
+        if (!override.enabled) { sound.current = playSound(type.id); return; }
         const { selectedSound, volume, selectedFileId } = override;
         if (selectedSound === "custom" && selectedFileId) {
             const dataUri = await ensureDataURICached(selectedFileId);
             if (!dataUri?.startsWith("data:audio/")) { showToast("No custom sound file available"); return; }
-            sound.current = playAudio(dataUri, { volume });
-        } else sound.current = playAudio(selectedSound === "default" ? type.id : selectedSound, { volume });
+            sound.current = playSound(dataUri, { volume });
+        } else sound.current = playSound(selectedSound === "default" ? type.id : selectedSound, { volume });
     };
 
     const uploadFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -95,7 +124,7 @@ function SoundCard({ type, override, files, onFilesChange, onChange }: { type: S
             {override.enabled && <>
                 <Button className={Margins.bottom16} variant="positive" onClick={previewSound}>Preview</Button>
                 <Heading className={Margins.bottom8}>Volume</Heading>
-                <Slider minValue={0} maxValue={500} markers={makeRange(0, 500, 50)} initialValue={override.volume} onValueRender={(v: number) => `${Math.round(v)}%`} className={Margins.bottom16} onValueChange={val => { sound.current && (sound.current.volume = val); override.volume = val; saveAndNotify(); }} />
+                <Slider minValue={0} maxValue={500} markers={makeRange(0, 500, 50)} initialValue={override.volume} onValueRender={(v: number) => `${Math.round(v)}%`} className={Margins.bottom16} onValueChange={val => { override.volume = val; setOverride(type.id, override); if (sound.current) sound.current.volume = val; saveAndNotify(); }} />
                 <Heading className={Margins.bottom8}>Sound Source</Heading>
                 <div style={{ marginBottom: 16 }}>
                     <Select closeOnSelect serialize={v => v} isSelected={v => v === override.selectedSound} options={sourceOpts} select={async v => { override.selectedSound = v; if (v === "custom") await cacheCustom(override.selectedFileId); await saveAndNotify(); }} />
@@ -144,8 +173,8 @@ function SettingsUI() {
         const reader = new FileReader();
         reader.onload = async ev => {
             try {
-                resetOverrides();
                 const imp = JSON.parse(ev.target?.result as string);
+                resetOverrides();
                 const remap: Record<string, string> = {};
                 let n = 0;
                 for (const fd of imp.files ?? []) {
@@ -208,12 +237,20 @@ export default definePlugin({
             find: "could not play audio",
             group: true,
             replacement: [
-                { match: /(let \i=class.{0,900}?new Audio;\i.src=)((\i\(\d+\))(?:\(`\.\/\$\{|.{0,50}concat\())this.name((?:\}\.mp3`|,".mp3"\))\))/, replace: '$3;$1this.type!=="discord"?this.audio:$2this.audio$4' },
+                { match: /(let \i=class.{0,1000}?new Audio;\i.src=)((\i\(\d+\))(?:\(`\.\/\$\{|.{0,50}concat\())this.name(\}\.mp3`\))/, replace: '$3;$1this.type!=="discord"?this.audio:$2this.audio$4' },
                 { match: /(new Audio;)(\i)(\.src=)/, replace: '$1$2.crossOrigin="anonymous";$2$3' },
-                { match: /(?<=constructor\((\i,\i,\i,\i)).{0,200}outputChannel=\i/, replace: ",options){$self.buildPlayer(this,$1,options);" },
-                { match: /(\i.pause\(\),(\i).src="".{0,20}?null)/, replace: "$2.onerror=()=>{},$1" },
-                { match: /(?<=(\i).onloadeddata=\(\)=>{)/, replace: "$self.applyBoost(this,$1)," }
+                { match: /constructor\(((?:\i,){3}\i)([^)]*)\)\{[^}]+}/, replace: "constructor(options,$1$2){$self.buildPlayer(this,options,$1);}" },
+                { match: /(\i.pause\(\),(\i).src="".{0,20}?null)/, replace: "$self.cleanupBoost($2),$2.onerror=()=>{},$1" },
+                { match: /(?<=(\i).onloadeddata=\(\)=>{)/, replace: "$1.playbackRate=this._speed,$self.applyBoost(this,$1)," },
+                { match: /(onerror=\()(\)=>{)(?=let)/, replace: "$1error$2this.onError?.(error);" },
+                { match: /(?<=onended=\(\)=>)(.{0,40}?),/, replace: "{$self.stopAudio(this);this.onEnded?.();}," },
+                { match: /(stop\()(\){)this.destroyAudio\(\)/, replace: "$1restart$2$self.stopAudio(this,restart);" },
+                { match: /let \i=new Audio\((\(0,\i.\i\)\(\i\)).{0,35}?play\(\)/, replace: "$self.playAudio($1)" }
             ]
+        },
+        {
+            find: "SoundUtils",
+            replacement: { match: /return new (\i)\((.{0,50}?)(?=}function)/, replace: "return new $1(undefined,$2" }
         },
         {
             find: '"UPDATE_OPEN_ON_STARTUP"',
@@ -225,22 +262,26 @@ export default definePlugin({
         }
     ],
 
-    buildPlayer(player: AudioPlayer, audio: string, _u: any, internalVolume: number, channel: string, options: any = {}) {
+    buildPlayer(player: AudioPlayer, options: any = {}, audio: string, _u: any, internalVolume: number, channel: string) {
         const v = Math.max(0, internalVolume || (options.volume ? options.volume / 100 : 1));
-        player.preprocessDataOriginal = { audio, volume: v };
+        player.preprocessDataOriginal = { audio, type: audioType(audio), volume: v, speed: Math.max(0.0625, Math.min(16, options.speed ?? 1)) };
         player.audio = audio;
         player._audio = null;
         player._volume = Math.min(1, v);
+        player._speed = player.preprocessDataOriginal.speed;
         player.type = audioType(audio);
-        (player as any).outputChannel = channel;
-        (player as any).preload = false;
-        (player as any).persistent = false;
+        player.outputChannel = channel;
+        player.preload = options.preload ?? false;
+        player.persistent = options.persistent ?? false;
+        player.onEnded = options.onEnded;
+        player.onError = options.onError;
         player.processAudio = () => this.processAudio(player);
         player.processAudio();
+        player.preload && player.ensureAudio();
     },
 
     processAudio(player: AudioPlayer) {
-        const prevAudio = player.preprocessDataCurrent?.audio;
+        player.preprocessDataPrevious = player.preprocessDataCurrent ? { ...player.preprocessDataCurrent } : null;
         const cur = { ...player.preprocessDataOriginal };
         cur.volume *= 100;
         const owner = soundTypes.find(s => s.seasonal && cur.audio in s.seasonal);
@@ -261,22 +302,24 @@ export default definePlugin({
         player.audio = cur.audio;
         player.type = audioType(cur.audio);
         player._volume = Math.min(1, Math.max(0, cur.volume));
-        if (prevAudio !== cur.audio) player.destroyAudio();
+        player._speed = Math.max(0.0625, Math.min(16, cur.speed ?? 1));
+        if (cur.audio !== player.preprocessDataPrevious?.audio) {
+            player.destroyAudio();
+            player.persistent && player.ensureAudio();
+        }
+        if (cur.volume !== player.preprocessDataPrevious?.volume) player._audio?.then(audio => { audio.volume = player._volume; setBoost(audio, cur.volume); });
+        if (cur.speed !== player.preprocessDataPrevious?.speed) player._audio?.then(audio => { audio.playbackRate = player._speed; });
     },
 
-    applyBoost(player: AudioPlayer, audio: HTMLAudioElement) {
-        const factor = Math.max(1, player.preprocessDataCurrent?.volume ?? 1);
-        if (factor <= 1.001) return;
-        try { audioCtx ??= new AudioContext(); } catch { return; }
-        if (audioCtx.state === "suspended") audioCtx.resume().catch(() => { });
-        try {
-            const source = audioCtx.createMediaElementSource(audio);
-            const gain = audioCtx.createGain();
-            gain.gain.value = factor;
-            source.connect(gain);
-            gain.connect(audioCtx.destination);
-        } catch (e) { console.error("[CustomSounds] Web Audio attach failed:", e); }
+    stopAudio(player: AudioPlayer, restart?: boolean) {
+        if (restart) player.ensureAudio().then(audio => { audio.currentTime = 0; audio.play(); });
+        else if (!player.persistent) player.destroyAudio();
+        else player._audio?.then(audio => { audio.pause(); audio.currentTime = 0; });
     },
+
+    playAudio(audio: string) { playSound(audio); },
+    applyBoost(player: AudioPlayer, audio: HTMLAudioElement) { setBoost(audio, player.preprocessDataCurrent?.volume ?? 1); },
+    cleanupBoost(audio: HTMLAudioElement) { clearBoost(audio); },
 
     async start() {
         for (const t of soundTypes) {

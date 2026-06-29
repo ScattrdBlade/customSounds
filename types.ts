@@ -4,18 +4,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-export interface SoundType {
-    name: string;
-    id: string;
-    seasonal?: Record<string, string>;
-}
-
-export interface SoundOverride {
-    enabled: boolean;
-    selectedSound: string;
-    volume: number;
-    selectedFileId?: string;
-}
+export interface SoundType { name: string; id: string; seasonal?: Record<string, string>; }
+export interface SoundOverride { enabled: boolean; selectedSound: string; volume: number; selectedFileId?: string; }
 
 export const soundTypes: readonly SoundType[] = [
     { name: "Activity End", id: "activity_end" }, { name: "Activity Launch", id: "activity_launch" },
