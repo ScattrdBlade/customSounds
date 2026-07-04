@@ -19,11 +19,14 @@ import { AudioPlayer, dataUriCache, deleteAudio, ensureDataURICached, ExportedAu
 import { makeEmptyOverride, SoundOverride, SoundType, soundTypes } from "./types";
 
 const cap = (s: string) => s.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-const audioType = (a: string) => a.startsWith("data:") || a.startsWith("http") || a.startsWith("blob:") ? "url" : "discord";
+const audioType = (a: string) => typeof a === "string" && (a.startsWith("data:") || a.startsWith("http") || a.startsWith("blob:")) ? "url" : "discord";
 const seasonalUrls: Record<string, string> = Object.fromEntries(soundTypes.flatMap(t => t.seasonal ? Object.entries(t.seasonal) : []));
 let audioCtx: AudioContext | null = null;
 
-// Per-element Web Audio gain for volume >100%; tracked so the graph is reused (createMediaElementSource throws if called twice), updated on volume change, and disconnected on teardown.
+function suppressAudioAbort(e: PromiseRejectionEvent) {
+    if ((e.reason as any)?.name === "AbortError") e.preventDefault();
+}
+
 const boostNodes = new WeakMap<HTMLAudioElement, { source: MediaElementAudioSourceNode; gain: GainNode; }>();
 
 function setBoost(audio: HTMLAudioElement, volume: number) {
@@ -239,7 +242,7 @@ export default definePlugin({
             replacement: [
                 { match: /(let \i=class.{0,1000}?new Audio;\i.src=)((\i\(\d+\))(?:\(`\.\/\$\{|.{0,50}concat\())this.name(\}\.mp3`\))/, replace: '$3;$1this.type!=="discord"?this.audio:$2this.audio$4' },
                 { match: /(new Audio;)(\i)(\.src=)/, replace: '$1$2.crossOrigin="anonymous";$2$3' },
-                { match: /constructor\(((?:\i,){3}\i)([^)]*)\)\{[^}]+}/, replace: "constructor(options,$1$2){$self.buildPlayer(this,options,$1);}" },
+                { match: /(constructor\((?:\i,){3}\i[^)]*\)\{)/, replace: "$1$self.buildPlayer(this,arguments);return;" },
                 { match: /(\i.pause\(\),(\i).src="".{0,20}?null)/, replace: "$self.cleanupBoost($2),$2.onerror=()=>{},$1" },
                 { match: /(?<=(\i).onloadeddata=\(\)=>{)/, replace: "$1.playbackRate=this._speed,$self.applyBoost(this,$1)," },
                 { match: /(onerror=\()(\)=>{)(?=let)/, replace: "$1error$2this.onError?.(error);" },
@@ -247,10 +250,6 @@ export default definePlugin({
                 { match: /(stop\()(\){)this.destroyAudio\(\)/, replace: "$1restart$2$self.stopAudio(this,restart);" },
                 { match: /let \i=new Audio\((\(0,\i.\i\)\(\i\)).{0,35}?play\(\)/, replace: "$self.playAudio($1)" }
             ]
-        },
-        {
-            find: "SoundUtils",
-            replacement: { match: /return new (\i)\((.{0,50}?)(?=}function)/, replace: "return new $1(undefined,$2" }
         },
         {
             find: '"UPDATE_OPEN_ON_STARTUP"',
@@ -262,8 +261,13 @@ export default definePlugin({
         }
     ],
 
-    buildPlayer(player: AudioPlayer, options: any = {}, audio: string, _u: any, internalVolume: number, channel: string) {
+    buildPlayer(player: AudioPlayer, args: IArguments) {
+        const audio: string = args[0];
+        const internalVolume: number = args[2];
+        const channel: string = args[3];
+        const options: any = args.length > 4 && args[4] && typeof args[4] === "object" && args[4].__customSound ? args[4] : {};
         const v = Math.max(0, internalVolume || (options.volume ? options.volume / 100 : 1));
+        player.__customSoundsPatched = true;
         player.preprocessDataOriginal = { audio, type: audioType(audio), volume: v, speed: Math.max(0.0625, Math.min(16, options.speed ?? 1)) };
         player.audio = audio;
         player._audio = null;
@@ -307,14 +311,14 @@ export default definePlugin({
             player.destroyAudio();
             player.persistent && player.ensureAudio();
         }
-        if (cur.volume !== player.preprocessDataPrevious?.volume) player._audio?.then(audio => { audio.volume = player._volume; setBoost(audio, cur.volume); });
-        if (cur.speed !== player.preprocessDataPrevious?.speed) player._audio?.then(audio => { audio.playbackRate = player._speed; });
+        if (cur.volume !== player.preprocessDataPrevious?.volume) player._audio?.then(audio => { audio.volume = player._volume; setBoost(audio, cur.volume); }).catch(() => { });
+        if (cur.speed !== player.preprocessDataPrevious?.speed) player._audio?.then(audio => { audio.playbackRate = player._speed; }).catch(() => { });
     },
 
     stopAudio(player: AudioPlayer, restart?: boolean) {
-        if (restart) player.ensureAudio().then(audio => { audio.currentTime = 0; audio.play(); });
+        if (restart) player.ensureAudio().then(audio => { audio.currentTime = 0; audio.play().catch(() => { }); }).catch(() => { });
         else if (!player.persistent) player.destroyAudio();
-        else player._audio?.then(audio => { audio.pause(); audio.currentTime = 0; });
+        else player._audio?.then(audio => { audio.pause(); audio.currentTime = 0; }).catch(() => { });
     },
 
     playAudio(audio: string) { playSound(audio); },
@@ -322,6 +326,7 @@ export default definePlugin({
     cleanupBoost(audio: HTMLAudioElement) { clearBoost(audio); },
 
     async start() {
+        window.addEventListener("unhandledrejection", suppressAudioAbort);
         for (const t of soundTypes) {
             const o = getOverride(t.id);
             if (o?.enabled && o.selectedSound === "custom" && o.selectedFileId) {
@@ -330,5 +335,8 @@ export default definePlugin({
         }
     },
 
-    stop() { dataUriCache.clear(); }
+    stop() {
+        window.removeEventListener("unhandledrejection", suppressAudioAbort);
+        dataUriCache.clear();
+    }
 });

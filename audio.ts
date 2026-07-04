@@ -20,17 +20,46 @@ export interface AudioPlayer {
     audio: string; _audio: null | Promise<HTMLAudioElement>; _volume: number; _speed: number; type: string;
     persistent: boolean; preload: boolean; outputChannel: string; onEnded?: () => void; onError?: (error: any) => void;
     processAudio(): void; destroyAudio(): void; ensureAudio(): Promise<HTMLAudioElement>; play(): void; stop(): void;
+    __customSoundsPatched?: boolean;
 }
 
 export const dataUriCache = new Map<string, string>();
 
 export function playAudio(audio: string, opts: { volume?: number; } = {}): PreviewHandle {
-    const p: AudioPlayer = new AudioPlayerCtor(opts, audio, null, null, "default");
-    p.play();
+    let p: AudioPlayer | undefined;
+    try {
+        p = new AudioPlayerCtor(audio, null, null, "default", { ...opts, __customSound: true });
+    } catch (e) {
+        console.error("[CustomSounds] Could not create audio player:", e);
+    }
+
+    if (p?.__customSoundsPatched) {
+        const playing = p.play() as unknown as Promise<unknown> | void;
+        (playing as Promise<unknown> | undefined)?.catch?.(() => { });
+        const player = p;
+        return {
+            stop: () => player.stop(),
+            get volume() { return player._volume * 100; },
+            set volume(v: number) { player.preprocessDataOriginal.volume = Math.max(0, v / 100); player.processAudio(); }
+        };
+    }
+    return playFallback(audio, opts);
+}
+
+function playFallback(audio: string, opts: { volume?: number; }): PreviewHandle {
+    let el: HTMLAudioElement | null = null;
+    if (/^(?:data:|https?:|blob:)/.test(audio)) {
+        el = new Audio(audio);
+        el.volume = Math.min(1, Math.max(0, (opts.volume ?? 100) / 100));
+        el.onerror = () => { };
+        el.play().catch(() => { });
+    } else {
+        console.warn("[CustomSounds] Audio patch inactive; cannot preview this sound. The plugin likely needs updating for this Discord build.");
+    }
     return {
-        stop: () => p.stop(),
-        get volume() { return p._volume * 100; },
-        set volume(v: number) { p.preprocessDataOriginal.volume = Math.max(0, v / 100); p.processAudio(); }
+        stop: () => { if (el) { el.pause(); el.currentTime = 0; } },
+        get volume() { return el ? el.volume * 100 : (opts.volume ?? 100); },
+        set volume(v: number) { if (el) el.volume = Math.min(1, Math.max(0, v / 100)); }
     };
 }
 
