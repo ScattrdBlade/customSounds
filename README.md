@@ -1,4 +1,4 @@
-**UPDATE: Fixed settings page crashing with large sound libraries, updated audio patches, and patched a memory leak.**
+**UPDATE: Rewritten for Discord's new sound engine.**
 
 > [!TIP]
 > **If you run into any issues, please let me know on [Discord](https://discord.gg/jHDJaW9Gyz)**
