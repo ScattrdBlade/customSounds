@@ -195,7 +195,12 @@ function dataUriToArrayBuffer(dataUri: string): ArrayBuffer | null {
 }
 
 export async function getAllAudio(): Promise<Record<string, StoredAudioFile>> {
-    return (await get(KEY)) ?? {};
+    try {
+        return (await get(KEY)) ?? {};
+    } catch (e) {
+        console.error("[CustomSounds] Failed to read audio store:", e);
+        return {};
+    }
 }
 
 export async function getAudioMeta(): Promise<Record<string, string>> {
