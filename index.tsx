@@ -120,11 +120,27 @@ function SettingsUI() {
     const fileInputRef = React.useRef<HTMLInputElement>(null);
 
     const loadFiles = React.useCallback(async () => {
-        try { setFiles(await getAudioMeta()); } catch (e) { console.error("[CustomSounds]", e); }
+        try {
+            const meta = await getAudioMeta();
+            setFiles(meta);
+            let healed = false;
+            for (const t of soundTypes) {
+                const o = getOverride(t.id);
+                if (o.selectedSound === "custom" && o.selectedFileId && !meta[o.selectedFileId]) {
+                    o.selectedFileId = undefined;
+                    o.selectedSound = "default";
+                    setOverride(t.id, o);
+                    healed = true;
+                }
+            }
+            if (healed) setResetTrigger(t => t + 1);
+        } catch (e) { console.error("[CustomSounds]", e); }
     }, []);
 
     React.useEffect(() => {
-        soundTypes.forEach(t => { if (!settings.store[t.id]) setOverride(t.id, makeEmptyOverride()); });
+        try {
+            soundTypes.forEach(t => { if (!settings.store[t.id]) setOverride(t.id, makeEmptyOverride()); });
+        } catch (e) { console.error("[CustomSounds]", e); }
         loadFiles();
     }, []);
 
