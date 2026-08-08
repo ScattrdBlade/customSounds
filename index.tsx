@@ -138,7 +138,9 @@ function SettingsUI() {
     }, []);
 
     React.useEffect(() => {
-        soundTypes.forEach(t => { if (!settings.store[t.id]) setOverride(t.id, makeEmptyOverride()); });
+        try {
+            soundTypes.forEach(t => { if (!settings.store[t.id]) setOverride(t.id, makeEmptyOverride()); });
+        } catch (e) { console.error("[CustomSounds]", e); }
         loadFiles();
     }, []);
 
