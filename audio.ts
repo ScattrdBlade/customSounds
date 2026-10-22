@@ -4,96 +4,149 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { get, set } from "@api/DataStore";
-import { findByCodeLazy, findByPropsLazy } from "@webpack";
+import { Logger } from "@utils/Logger";
+import { findByCodeLazy, findByPropsLazy, findStoreLazy, mapMangledModuleLazy } from "@webpack";
+import { MediaEngineStore } from "@webpack/common";
 
-import { soundTypes } from "./types";
+import { addFile, blobHash, getFile, hasAudio, MAX_FILE_BYTES, StoredFile } from "./files";
+import { DEFAULT_VOLUME, soundTypes } from "./types";
 
-const KEY = "ScattrdCustomSounds";
+export const logger = new Logger("CustomSounds");
+
 const WebAudioSound = findByCodeLazy("could not play audio:");
 const soundModule = findByPropsLazy("WebAudioSound", "voiceSinkId");
-const MediaEngineStore = findByPropsLazy("getOutputVolume", "getOutputDevices");
+const SoundpackStore = findStoreLazy("SoundpackStore");
+const Soundpacks = mapMangledModuleLazy('message1:"bit_message1"', {
+    getPackSounds: m => typeof m === "function"
+});
 
-export interface PreviewHandle { stop(): void; volume: number; }
-export interface StoredAudioFile { id: string; name: string; type: string; buffer: ArrayBuffer; dataUri: string; }
-export interface ExportedAudioFile { id: string; name: string; type: string; dataUri: string; }
-
+export interface PreviewHandle {
+    stop(): void;
+    setVolume(pct: number): void;
+}
 
 export interface AudioPlayer {
     name: string;
     _volume: number;
     _audio: Promise<HTMLAudioElement> | null;
     outputChannel: string;
-    trackNotificationFailure: boolean;
     volume: number;
     play(): void;
-    loop(): void;
-    pause(): void;
     stop(): void;
     ensureAudio(): Promise<HTMLAudioElement>;
-    destroyAudio(): void;
-    __customSoundsPatched?: boolean;
+    __csPatched?: boolean;
     __csOriginalName?: string;
     __csPreviewVolume?: number;
+    __csPreviewBase?: number;
     __csDefaultSrc?: string;
 }
 
-export const isUrl = (s: string) => typeof s === "string" && /^(?:data:|https?:|blob:)/.test(s);
+export const isUrl = (s: unknown) => typeof s === "string" && /^(?:https?:|blob:)/.test(s);
 
-export const dataUriCache = new Map<string, string>();
-export const seasonalUrls: Record<string, string> = Object.fromEntries(
-    soundTypes.flatMap(t => t.seasonal ? Object.entries(t.seasonal) : [])
-);
+const toElementVolume = (pct: number) => Math.min(1, Math.max(0, pct / 100));
 
-export function getOutputVolume(): number {
+export const seasonalUrls = new Map(soundTypes.flatMap(t => Object.entries(t.seasonal ?? {})));
+
+export type PatchHealth = "ok" | "no-volume" | "no-init" | "reverted" | "init-throws";
+
+const hasVolumeHook = (fn: unknown) => typeof fn === "function" && String(fn).includes("modifyVolume");
+
+export function probePatched(): PatchHealth | null {
+    let proto: any;
     try {
-        const v = MediaEngineStore.getOutputVolume();
-        return typeof v === "number" && !isNaN(v) ? v : 100;
+        proto = WebAudioSound.prototype;
+        if (!proto) return null;
     } catch {
-        return 100;
+        return null;
     }
+
+    let initHooked: boolean;
+    try {
+        const p: AudioPlayer = new WebAudioSound("message1", "message1", 0, "default");
+        initHooked = !!p.__csPatched;
+    } catch {
+        return "init-throws";
+    }
+
+    let volumeHooked = false;
+    try {
+        // A later Discord build may move the volume code out of ensureAudio
+        volumeHooked = hasVolumeHook(proto.ensureAudio) || Object.getOwnPropertyNames(proto).some(k => {
+            if (k === "constructor") return false;
+            const d = Object.getOwnPropertyDescriptor(proto, k);
+            return [d?.value, d?.get, d?.set].some(hasVolumeHook);
+        });
+    } catch (e) {
+        logger.error("Failed to check for the volume patch:", e);
+    }
+
+    if (initHooked) return volumeHooked ? "ok" : "no-volume";
+    return volumeHooked ? "no-init" : "reverted";
 }
 
-export function getPlayerSinkId(player: AudioPlayer): string {
-    try {
-        if (IS_WEB || player.outputChannel !== "voice") return "default";
-        return soundModule.voiceSinkId || "default";
-    } catch {
-        return "default";
-    }
-}
-
+// These are never closed, closing one would silence every sound routed through it
 const audioCtxs = new Map<string, AudioContext>();
-const boostNodes = new WeakMap<HTMLAudioElement, { source: MediaElementAudioSourceNode; gain: GainNode; }>();
+
+interface BoostNodes {
+    source: MediaElementAudioSourceNode;
+    gain: GainNode;
+    limiter: DynamicsCompressorNode;
+    ctx: AudioContext;
+}
+const boostNodes = new WeakMap<HTMLAudioElement, BoostNodes>();
+let warnedResumeFailure = false;
 
 function getAudioCtx(sinkId: string): AudioContext | null {
     let ctx = audioCtxs.get(sinkId);
     if (!ctx) {
-        try { ctx = new AudioContext(); } catch { return null; }
-        if (sinkId !== "default" && "setSinkId" in ctx) {
-            (ctx as any).setSinkId(sinkId).catch(() => { });
+        try {
+            ctx = new AudioContext();
+        } catch (e) {
+            logger.error("Failed to create AudioContext:", e);
+            return null;
         }
         audioCtxs.set(sinkId, ctx);
+        if (sinkId !== "default" && "setSinkId" in ctx)
+            (ctx as any).setSinkId(sinkId).catch((e: unknown) => logger.warn(`Failed to set the boost output device to ${sinkId}:`, e));
     }
-    if (ctx.state === "suspended") ctx.resume().catch(() => { });
     return ctx;
 }
 
-export function applyBoost(audio: HTMLAudioElement, volume: number, sinkId = "default") {
+export function applyBoost(audio: HTMLAudioElement, volume: number, sinkId: string) {
     const factor = Math.max(1, volume);
-    if (factor <= 1.001 && !boostNodes.has(audio)) return;
-    const ctx = getAudioCtx(sinkId);
-    if (!ctx) return;
     let nodes = boostNodes.get(audio);
     if (!nodes) {
+        // Routing an element through an AudioContext can't be undone, so only do it when actually boosting
+        if (factor <= 1.001) return;
+        const ctx = getAudioCtx(sinkId);
+        if (!ctx) return;
         try {
             const source = ctx.createMediaElementSource(audio);
             const gain = ctx.createGain();
+            // Limiter to stop boosted sounds from clipping. Chromium adds makeup gain, so keep the threshold close to 0
+            const limiter = ctx.createDynamicsCompressor();
+            limiter.threshold.value = -1;
+            limiter.knee.value = 0;
+            limiter.ratio.value = 20;
+            limiter.attack.value = 0.001;
+            limiter.release.value = 0.1;
             source.connect(gain);
-            gain.connect(ctx.destination);
-            nodes = { source, gain };
+            gain.connect(limiter);
+            limiter.connect(ctx.destination);
+            nodes = { source, gain, limiter, ctx };
             boostNodes.set(audio, nodes);
-        } catch (e) { console.error("[CustomSounds] Web Audio attach failed:", e); return; }
+        } catch (e) {
+            logger.error("Failed to set up the volume boost:", e);
+            return;
+        }
+    }
+    if (nodes.ctx.state === "suspended") {
+        nodes.ctx.resume().catch(e => {
+            if (!warnedResumeFailure) {
+                warnedResumeFailure = true;
+                logger.warn("Failed to resume AudioContext:", e);
+            }
+        });
     }
     nodes.gain.gain.value = factor;
 }
@@ -101,148 +154,285 @@ export function applyBoost(audio: HTMLAudioElement, volume: number, sinkId = "de
 export function clearBoost(audio: HTMLAudioElement) {
     const nodes = boostNodes.get(audio);
     if (!nodes) return;
-    try { nodes.source.disconnect(); nodes.gain.disconnect(); } catch { }
+    nodes.source.disconnect();
+    nodes.gain.disconnect();
+    nodes.limiter.disconnect();
     boostNodes.delete(audio);
 }
 
-export function effectiveVolume(volumePct: number, outputVolume: number): number {
-    return Math.max(0, Math.min(outputVolume, 100) / 100 * (volumePct / 100));
-}
-
-export function applyElementVolume(el: HTMLAudioElement, volumePct: number, outputVolume: number, sinkId = "default") {
-    const effective = effectiveVolume(volumePct, outputVolume);
-    el.volume = Math.min(1, effective);
-    applyBoost(el, effective, sinkId);
-}
-
-export function playAudio(audio: string, opts: { volume?: number; } = {}): PreviewHandle {
-    let p: AudioPlayer | undefined;
+export function getPlayerSinkId(player: AudioPlayer): string {
+    // Discord plays anything not on the default channel through the voice output device
+    if (IS_WEB || !player.outputChannel || player.outputChannel === "default") return "default";
     try {
-        p = new WebAudioSound(audio, audio, Math.min(1, Math.max(0, (opts.volume ?? 100) / 100)), "default");
-    } catch (e) {
-        console.error("[CustomSounds] Could not create audio player:", e);
+        return soundModule.voiceSinkId || "default";
+    } catch {
+        return "default";
     }
-
-    if (p?.__customSoundsPatched) {
-        const player = p;
-        player.__csPreviewVolume = Math.max(0, opts.volume ?? 100);
-        try { player.play(); } catch { }
-        return {
-            stop: () => { try { player.stop(); } catch { } },
-            get volume() { return player.__csPreviewVolume ?? 100; },
-            set volume(v: number) {
-                player.__csPreviewVolume = Math.max(0, v);
-                player._audio?.then(el => applyElementVolume(el, player.__csPreviewVolume!, getOutputVolume(), getPlayerSinkId(player))).catch(() => { });
-            }
-        };
-    }
-
-    if (p && !isUrl(audio)) {
-        console.warn("[CustomSounds] Audio patch inactive; playing the default sound without overrides. The plugin likely needs updating for this Discord build.");
-        const player = p;
-        try { player.play(); } catch { }
-        return {
-            stop: () => { try { player.stop(); } catch { } },
-            get volume() { return Math.round((player._volume ?? 1) * 100); },
-            set volume(v: number) { try { player.volume = Math.min(1, Math.max(0, v / 100)); } catch { } }
-        };
-    }
-    return playFallback(audio, opts);
 }
 
-function playFallback(audio: string, opts: { volume?: number; }): PreviewHandle {
-    if (seasonalUrls[audio]) audio = seasonalUrls[audio];
-    let el: HTMLAudioElement | null = null;
-    if (isUrl(audio)) {
-        el = new Audio(audio);
-        el.volume = Math.min(1, Math.max(0, (opts.volume ?? 100) / 100));
-        el.onerror = () => { };
-        el.play().catch(() => { });
-    } else {
-        console.warn("[CustomSounds] Audio patch inactive; cannot preview this sound. The plugin likely needs updating for this Discord build.");
+export function effectiveVolume(volumePct: number, outputVolume: number, baseVolume: number): number {
+    return Math.max(0, outputVolume / 100 * baseVolume * (volumePct / 100));
+}
+
+export function applyElementVolume(audio: HTMLAudioElement, volumePct: number, outputVolume: number, sinkId: string, baseVolume: number) {
+    const effective = effectiveVolume(volumePct, outputVolume, baseVolume);
+    audio.volume = Math.min(1, effective);
+    applyBoost(audio, effective, sinkId);
+}
+
+export function playerBaseVolume(player: AudioPlayer): number {
+    if (player.__csPreviewVolume != null) return player.__csPreviewBase ?? 1;
+    const v = player._volume;
+    return Number.isFinite(v) && v >= 0 ? v : 1;
+}
+
+export const lastBaseVolume = new Map<string, number>();
+
+// Dev builds don't cache failed lazy finds, so remember it or every render would search all modules again
+let soundpackLookupBroken = false;
+
+export function getNativeSoundName(id: string): string {
+    if (soundpackLookupBroken) return id;
+    try {
+        const mapped = Soundpacks.getPackSounds(SoundpackStore.getSoundpack())?.[id];
+        return typeof mapped === "string" && mapped ? mapped : id;
+    } catch (e) {
+        soundpackLookupBroken = true;
+        logger.warn("Failed to get the active sound pack:", e);
+        return id;
     }
+}
+
+export function playSound(sound: string, opts: { volume?: number; originalName?: string; baseVolume?: number; }): PreviewHandle {
+    let player: AudioPlayer;
+    try {
+        player = new WebAudioSound(sound, opts.originalName ?? sound, toElementVolume(opts.volume ?? DEFAULT_VOLUME), "default");
+    } catch (e) {
+        logger.error("Failed to create audio player:", e);
+        return playFallback(sound, opts);
+    }
+
+    const patched = !!player.__csPatched;
+    if (!patched && isUrl(sound)) return playFallback(sound, opts);
+
+    if (patched) {
+        player.__csPreviewVolume = Math.max(0, opts.volume ?? DEFAULT_VOLUME);
+        player.__csPreviewBase = opts.baseVolume ?? 1;
+    } else {
+        logger.warn("Audio patch isn't applied, previewing the default sound");
+    }
+
+    try {
+        player.play();
+    } catch (e) {
+        logger.error("Failed to play preview:", e);
+    }
+
     return {
-        stop: () => { if (el) { el.pause(); el.currentTime = 0; } },
-        get volume() { return el ? el.volume * 100 : (opts.volume ?? 100); },
-        set volume(v: number) { if (el) el.volume = Math.min(1, Math.max(0, v / 100)); }
+        stop: () => {
+            try {
+                player.stop();
+            } catch (e) {
+                logger.warn("Failed to stop preview:", e);
+            }
+        },
+        setVolume: pct => {
+            if (!patched) {
+                player.volume = toElementVolume(pct);
+                return;
+            }
+            const volume = Math.max(0, pct);
+            player.__csPreviewVolume = volume;
+            player._audio
+                ?.then(audio => applyElementVolume(audio, volume, MediaEngineStore.getOutputVolume(), getPlayerSinkId(player), playerBaseVolume(player)))
+                .catch(e => logger.warn("Failed to set preview volume:", e));
+        }
     };
 }
 
-async function hashBuffer(buffer: ArrayBuffer): Promise<string> {
-    const digest = await crypto.subtle.digest("SHA-256", buffer);
-    return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+function playFallback(sound: string, opts: { volume?: number; }): PreviewHandle {
+    const src = seasonalUrls.get(sound) ?? sound;
+    let audio: HTMLAudioElement | null = null;
+    if (isUrl(src)) {
+        audio = new Audio(src);
+        audio.volume = toElementVolume(opts.volume ?? DEFAULT_VOLUME);
+        audio.onerror = () => logger.warn(`Failed to load preview: ${src}`);
+        audio.play().catch(e => logger.warn("Failed to play preview:", e));
+    } else {
+        logger.warn("Audio patch isn't applied, can't preview this sound");
+    }
+
+    return {
+        stop: () => {
+            if (!audio) return;
+            audio.pause();
+            audio.currentTime = 0;
+        },
+        setVolume: pct => {
+            if (audio) audio.volume = toElementVolume(pct);
+        }
+    };
 }
 
-async function generateDataURI(buffer: ArrayBuffer, type: string): Promise<string> {
-    const blob = new Blob([new Uint8Array(buffer)], { type: type || "audio/mpeg" });
-    return new Promise((resolve, reject) => {
+export const ACCEPTED_AUDIO = ".mp3,.wav,.ogg,.oga,.opus,.m4a,.flac,.aac,.webm,.mp4";
+const MIME_BY_EXT: Record<string, string> = {
+    mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", oga: "audio/ogg", opus: "audio/ogg",
+    m4a: "audio/mp4", mp4: "audio/mp4", flac: "audio/flac", aac: "audio/aac", webm: "audio/webm"
+};
+export function mimeFor(name: string, type: unknown): string {
+    // Backups store the type in a data URI, so it can't contain , or ;
+    if (typeof type === "string" && /^[\w.+-]+\/[\w.+-]{1,100}$/.test(type) && type !== "application/octet-stream") return type;
+    const ext = name.split(".").pop()?.toLowerCase() ?? "";
+    return Object.hasOwn(MIME_BY_EXT, ext) ? MIME_BY_EXT[ext] : "audio/mpeg";
+}
+
+export interface ExportedAudioFile {
+    id: string;
+    name: string;
+    type: string;
+    dataUri: string;
+}
+
+export interface ImportFilesResult {
+    remap: Map<string, string>;
+    imported: number;
+    skipped: number;
+}
+
+export const MAX_DATA_URI_LENGTH = Math.ceil(MAX_FILE_BYTES * 4 / 3) + 128;
+export const MAX_IMPORT_TOTAL_BYTES = 300 * 1024 * 1024;
+export const MAX_BACKUP_BYTES = 500 * 1024 * 1024;
+
+export function dataUriToBytes(uri: string) {
+    // Only accepts data URIs that decode the same way here as when Chromium plays them
+    const m = /^data:([^,#]*),([^#]*)/i.exec(uri.replace(/(?<![\0- ])[\0- ]+$|[\t\n\r]/g, ""));
+    if (!m) return null;
+    const [matched, meta, data] = m;
+    const base64 = /; *base64 *$/i.test(meta);
+    if (/[^ -~]/.test(matched) || /; *base64 *;/i.test(meta)) return null;
+    if (!base64 && data.includes(" ")) return null;
+
+    const body = data.replace(/%([\da-f]{2})/gi, (_, h) => String.fromCharCode(parseInt(h, 16)));
+    try {
+        const bin = base64 ? atob(body) : body;
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return bytes;
+    } catch {
+        return null;
+    }
+}
+
+export function blobToDataUri(blob: Blob) {
+    return new Promise<string>((resolve, reject) => {
         const r = new FileReader();
-        r.onloadend = () => resolve(r.result as string);
-        r.onerror = reject;
+        r.onload = () => resolve(r.result as string);
+        r.onerror = () => reject(r.error);
         r.readAsDataURL(blob);
     });
 }
 
-function dataUriToArrayBuffer(dataUri: string): ArrayBuffer | null {
-    const i = dataUri.indexOf(",");
-    if (i === -1 || !dataUri.slice(0, i).includes(";base64")) return null;
-    try {
-        const bin = atob(dataUri.slice(i + 1));
-        const bytes = new Uint8Array(bin.length);
-        for (let j = 0; j < bin.length; j++) bytes[j] = bin.charCodeAt(j);
-        return bytes.buffer;
-    } catch { return null; }
-}
+// Non-ASCII is escaped so the backup is one byte per character
+// Files that don't fit in this backup go in `rest` for the next part, files too big for any part go in `left`
+export async function buildBackup(head: object, ids: Iterable<string>, old?: ReadonlyMap<string, StoredFile>) {
+    const ascii = (s: string) => s.replace(/[\u007f-\uffff]/g, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+    const tail = "\n  ]\n}\n";
+    const parts: BlobPart[] = [ascii(JSON.stringify(head, null, 2)).slice(0, -2) + ',\n  "files": ['];
+    let total = new Blob([parts[0], tail]).size;
+    let audioBytes = 0;
+    let bundled = 0;
+    let unbundled = 0;
+    const left: string[] = [];
+    const rest: string[] = [];
+    const fromOld: string[] = [];
 
-export async function getAllAudio(): Promise<Record<string, StoredAudioFile>> {
-    return (await get(KEY)) ?? {};
-}
-
-export async function getAudioMeta(): Promise<Record<string, string>> {
-    const meta: Record<string, string> = {};
-    for (const [id, f] of Object.entries(await getAllAudio())) meta[id] = f.name;
-    return meta;
-}
-
-export async function saveAudio(file: File): Promise<string> {
-    const buffer = await file.arrayBuffer();
-    const id = await hashBuffer(buffer);
-    const dataUri = await generateDataURI(buffer, file.type);
-    const all = (await get(KEY)) ?? {};
-    all[id] = { id, name: file.name, type: file.type, buffer, dataUri };
-    await set(KEY, all);
-    return id;
-}
-
-export async function deleteAudio(id: string): Promise<void> {
-    const all = await getAllAudio();
-    delete all[id];
-    await set(KEY, all);
-    dataUriCache.delete(id);
-}
-
-export async function ensureDataURICached(fileId: string): Promise<string | null> {
-    if (dataUriCache.has(fileId)) return dataUriCache.get(fileId)!;
-    try {
-        const e = (await getAllAudio())[fileId];
-        if (e?.dataUri) { dataUriCache.set(fileId, e.dataUri); return e.dataUri; }
-        if (e?.buffer instanceof ArrayBuffer) {
-            const dataUri = await generateDataURI(e.buffer, e.type);
-            const cur = await getAllAudio();
-            if (cur[fileId]) { cur[fileId].dataUri = dataUri; await set(KEY, cur); }
-            dataUriCache.set(fileId, dataUri);
-            return dataUri;
+    for (const id of new Set(ids)) {
+        const own = await getFile(id).catch(e => void logger.warn(`Export: failed to read file ${id}:`, e));
+        const isOld = !!old?.has(id) && await blobHash(own?.blob) !== id;
+        const file = isOld ? old?.get(id) : own;
+        if (!hasAudio(file)) {
+            unbundled++;
+            continue;
         }
-    } catch (e) { console.error("[CustomSounds]", e); }
-    return null;
+
+        const name = typeof file.name === "string" ? file.name : "Unknown";
+        if (file.blob.size > MAX_FILE_BYTES) {
+            left.push(name);
+            continue;
+        }
+        if (audioBytes + file.blob.size > MAX_IMPORT_TOTAL_BYTES) {
+            rest.push(id);
+            continue;
+        }
+
+        const dataUri = await blobToDataUri(file.blob).catch(e => void logger.warn(`Export: failed to read "${name}":`, e));
+        if (!dataUri) {
+            unbundled++;
+            continue;
+        }
+
+        const header = `data:${mimeFor(name, file.blob.type.slice(0, 100))};base64,`;
+        const body = dataUri.slice(dataUri.lastIndexOf(",") + 1);
+        if (header.length + body.length > MAX_DATA_URI_LENGTH) {
+            left.push(name);
+            continue;
+        }
+
+        const meta = ascii(JSON.stringify({ id, name, type: file.blob.type, dataUri: "" })).slice(0, -2);
+        const part = new Blob([`${bundled ? "," : ""}\n    ${meta}${header}`, body, "\"}"]);
+        if (total + part.size > MAX_BACKUP_BYTES) {
+            if (bundled) rest.push(id);
+            else left.push(name);
+            continue;
+        }
+
+        parts.push(part);
+        total += part.size;
+        audioBytes += file.blob.size;
+        bundled++;
+        if (isOld) fromOld.push(name);
+    }
+
+    parts.push(tail);
+    return { backup: new Blob(parts, { type: "application/json" }), size: total, bundled, unbundled, left, rest, fromOld };
 }
 
-export async function importAudio(data: ExportedAudioFile): Promise<string | null> {
-    const buffer = data.dataUri ? dataUriToArrayBuffer(data.dataUri) : null;
-    if (!buffer) return null;
-    const id = await hashBuffer(buffer);
-    const all = (await get(KEY)) ?? {};
-    all[id] = { id, name: data.name || "Imported", type: data.type || "audio/mpeg", buffer, dataUri: data.dataUri };
-    await set(KEY, all);
-    return id;
+export async function importAudioFiles(files: readonly Partial<ExportedAudioFile>[]): Promise<ImportFilesResult> {
+    const remap = new Map<string, string>();
+    const ids = new Set<string>();
+    let skipped = 0;
+    let totalBytes = 0;
+    for (const fd of files) {
+        const name = typeof fd.name === "string" && fd.name ? fd.name.slice(0, 200) : "Imported";
+        const skip = (reason: string) => {
+            logger.warn(`Skipping imported file "${name}": ${reason}`);
+            skipped++;
+        };
+        if (typeof fd.dataUri !== "string" || fd.dataUri.length > MAX_DATA_URI_LENGTH) {
+            skip("missing or oversized audio data");
+            continue;
+        }
+        const bytes = dataUriToBytes(fd.dataUri);
+        if (!bytes) {
+            skip("audio data is not a valid data URI");
+            continue;
+        }
+        if (!bytes.length) {
+            skip("audio data is empty");
+            continue;
+        }
+        if (bytes.length > MAX_FILE_BYTES) {
+            skip("file is too large");
+            continue;
+        }
+        if (totalBytes + bytes.length > MAX_IMPORT_TOTAL_BYTES) {
+            skip("total import size is too large");
+            continue;
+        }
+        totalBytes += bytes.length;
+        const { id } = await addFile(new File([bytes], name, { type: mimeFor(name, fd.type) }));
+        ids.add(id);
+        if (typeof fd.id === "string" && fd.id) remap.set(fd.id, id);
+    }
+    return { remap, imported: ids.size, skipped };
 }

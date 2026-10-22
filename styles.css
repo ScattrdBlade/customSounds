@@ -1,0 +1,7 @@
+.vc-customSounds-card {
+    padding: 1em 1em 0;
+}
+
+.vc-customSounds-muted {
+    color: var(--text-muted);
+}
