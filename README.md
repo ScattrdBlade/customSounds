@@ -1,25 +1,23 @@
-**UPDATE: New file storage, full backups and a fallback for missing files.**
-
 > [!TIP]
 > **If you run into any issues, please let me know in the [Support Server](https://discord.gg/jHDJaW9Gyz)**
 
 # Custom Sounds (Vencord)
 
-Replace any of Discord's sounds with your own audio or a seasonal variant, and give each sound its own volume (up to 500%). Every sound has a live preview, a search box helps you find it, and Export/Import backs up your settings together with your audio files.
+Replace any of Discord's sounds with your own audio or a seasonal variant, and give each sound its own volume (up to 500%). Every sound has a live preview, a search box helps you find it, and **Export backup** and **Import backup** in the ⋯ menu save and restore your settings together with your audio files.
 
 Each sound can play **Native** (whatever Discord would play, including sound packs and seasonal sounds), **Regular** (always the normal sound), a seasonal variant, or a **Custom** file you upload. Files can be up to 50 MB, and MP3 or OGG works best.
 
 ## Backups and syncing
 
 - Your audio files stay on the device you uploaded them on. Vencord's settings sync and settings backups don't include them.
-- Use **Export** before reinstalling or switching PCs. It's the only backup that includes the audio. Big libraries are saved as several files (`-part2`, `-part3`, ...), so import the part files first and the main file last.
+- Use **Export backup** (in the ⋯ menu) before reinstalling or switching PCs. It's the only backup that includes the audio. Big libraries are saved as several files (`-part2`, `-part3`, ...), so import the part files first and the main file last.
 - If your settings sync to a device that doesn't have the file, Discord's own sound plays instead. Upload the same file on that device to fix it.
 
 ## Updating from an older version
 
 This version stores your files in a new place. On first start it copies your old files over and checks them, and the old storage is deleted once everything has been moved. If copying fails, nothing is deleted and it tries again on the next start, so don't clear Discord's data.
 
-Equicord's CustomSounds and older versions of this plugin can't read the new storage. To switch back, Export first and import that backup in the version you're switching to.
+Equicord's CustomSounds and older versions of this plugin can't read the new storage. To switch back, use **Export backup** first and import that backup in the version you're switching to.
 
 ## DOWNLOAD INSTRUCTIONS
 

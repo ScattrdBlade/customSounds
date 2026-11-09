@@ -11,7 +11,6 @@ import { dataUriToBytes, logger, mimeFor } from "./audio";
 import { blobHash, dropUrl, FILE_PREFIX, getFile, sha256, StoredFile } from "./files";
 
 const LEGACY_KEY = "ScattrdCustomSounds";
-// Copies younger than this are checked again on a later start before the old data is deleted
 const RECHECK_DELAY = 10 * 60 * 1000;
 
 interface LegacyEntry {
@@ -61,6 +60,18 @@ let migration: Promise<boolean> | undefined;
 export const migrateLegacy = () => migration ??= withLock(migrate).catch(e => {
     logger.error("Failed to move the old sound storage, it will retry on the next start. If this keeps happening, see the README:", e);
     return false;
+});
+
+export const hasLegacy = async () => await DataStore.get(LEGACY_KEY) != null;
+
+export const clearLegacy = () => withLock(async () => {
+    const legacy = await DataStore.get<Legacy>(LEGACY_KEY);
+    const ids = new Set([...unmoved, ...(legacy && typeof legacy === "object" ? Object.keys(legacy) : [])]);
+    await DataStore.delMany([LEGACY_KEY, LEGACY_KEY + "_Metadata"]);
+    unmoved.clear();
+    legacyNames.clear();
+    migration = Promise.resolve(true);
+    return ids;
 });
 
 export const forgetLegacy = (id: string) => withLock(async () => {
@@ -116,7 +127,6 @@ async function migrate() {
             const hash = hashes[best];
             const storedHash = await blobHash(existing?.blob);
 
-            // The copy here can't be read and the old data isn't that file, so leave both alone
             if (!storedHash && existing?.blob instanceof Blob && hash !== id && /^[\da-f]{64}$/.test(id)) {
                 kept.push(name);
                 if (typeof entry?.dataUri === "string" && entry.dataUri.startsWith("data:")) unmoved.add(id);

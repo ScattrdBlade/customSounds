@@ -26,7 +26,6 @@ export interface SoundpackRequire {
 export const DEFAULT_VOLUME = 100;
 export const MAX_VOLUME = 500;
 
-// "Unknown" is the placeholder for files without a name
 export function cleanName(name: unknown) {
     if (typeof name !== "string" || !name || name === "Unknown") return undefined;
     return name.slice(0, 200).replace(/[\ud800-\udbff]$/, "");
@@ -124,7 +123,13 @@ export const soundTypes: readonly SoundType[] = [
         name: "Message 1 (All Message Notifications)",
         id: "message1",
         seasonal: {
-            halloween_message1: "https://discord.com/assets/c269de500ca3cb7b.mp3"
+            halloween_message1: "https://discord.com/assets/c269de500ca3cb7b.mp3",
+            bit_message1: "https://discord.com/assets/795109c70fe6ea7b.mp3",
+            bop_message1: "https://discord.com/assets/909464bf55b13935.mp3",
+            ducky_message1: "https://discord.com/assets/7d8709c9f90d5d1e.mp3",
+            lofi_message1: "https://discord.com/assets/5aa5ffdc82cb3c74.mp3",
+            asmr_message1: "https://discord.com/assets/7abbc45d8e7b179a.mp3",
+            discodo: "https://discord.com/assets/cb85be48267eb1b4.mp3"
         }
     },
     { name: "Message 2 (Friend Started Playing)", id: "message2" },

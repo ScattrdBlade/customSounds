@@ -17,7 +17,6 @@ const MAX_FILE_MB = 50;
 export const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
 
 const urls = new Map<string, string>();
-// Files that aren't on this device, so their sounds play Discord's own sound and volume
 const absent = new Set<string>();
 export const isAbsent = (id: string) => absent.has(id);
 
@@ -58,8 +57,6 @@ export async function addFile(file: File) {
     if (!file.size) throw new Error("file is empty");
     const bytes = await file.arrayBuffer();
     const id = await sha256(bytes);
-
-    // Reuse the stored copy only if it's intact, otherwise write it again
     const old = await getFile(id);
     if (old && await blobHash(old.blob) === id) {
         absent.delete(id);
@@ -78,9 +75,18 @@ export async function addFile(file: File) {
 
 export async function removeFile(id: string) {
     await DataStore.del(FILE_PREFIX + id);
-    // Drop the URL after deleting, so a loadFileUrl() that's still running can't put it back
     dropUrl(id);
     absent.add(id);
+}
+export async function removeAllFiles() {
+    const keys = (await DataStore.keys()).filter((k): k is string => typeof k === "string" && k.startsWith(FILE_PREFIX));
+    await DataStore.delMany(keys);
+    const ids = keys.map(key => key.slice(FILE_PREFIX.length));
+    for (const id of ids) {
+        dropUrl(id);
+        absent.add(id);
+    }
+    return ids;
 }
 
 export async function loadFileUrl(id: string) {

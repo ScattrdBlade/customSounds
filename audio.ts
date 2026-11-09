@@ -5,6 +5,7 @@
  */
 
 import { Logger } from "@utils/Logger";
+import { wordsFromSnake, wordsToTitle } from "@utils/text";
 import { findByCodeLazy, findByPropsLazy, findStoreLazy, mapMangledModuleLazy } from "@webpack";
 import { MediaEngineStore } from "@webpack/common";
 
@@ -14,10 +15,13 @@ import { DEFAULT_VOLUME, soundTypes } from "./types";
 export const logger = new Logger("CustomSounds");
 
 const WebAudioSound = findByCodeLazy("could not play audio:");
-const soundModule = findByPropsLazy("WebAudioSound", "voiceSinkId");
+const soundModule = findByPropsLazy("WebAudioSound");
 const SoundpackStore = findStoreLazy("SoundpackStore");
 const Soundpacks = mapMangledModuleLazy('message1:"bit_message1"', {
     getPackSounds: m => typeof m === "function"
+});
+const SoundpackIds = mapMangledModuleLazy('CLASSIC="classic"', {
+    Soundpack: m => typeof m?.CLASSIC === "string"
 });
 
 export interface PreviewHandle {
@@ -154,9 +158,7 @@ export function applyBoost(audio: HTMLAudioElement, volume: number, sinkId: stri
 export function clearBoost(audio: HTMLAudioElement) {
     const nodes = boostNodes.get(audio);
     if (!nodes) return;
-    nodes.source.disconnect();
-    nodes.gain.disconnect();
-    nodes.limiter.disconnect();
+    for (const n of [nodes.source, nodes.gain, nodes.limiter]) n.disconnect();
     boostNodes.delete(audio);
 }
 
@@ -164,7 +166,8 @@ export function getPlayerSinkId(player: AudioPlayer): string {
     // Discord plays anything not on the default channel through the voice output device
     if (IS_WEB || !player.outputChannel || player.outputChannel === "default") return "default";
     try {
-        return soundModule.voiceSinkId || "default";
+        // Its export name is minified, but the output device id is the module's only string
+        return Object.values(soundModule).find(v => typeof v === "string") || "default";
     } catch {
         return "default";
     }
@@ -200,6 +203,34 @@ export function getNativeSoundName(id: string): string {
         soundpackLookupBroken = true;
         logger.warn("Failed to get the active sound pack:", e);
         return id;
+    }
+}
+
+export interface Soundpack {
+    key: string;
+    name: string;
+    sounds: [id: string, sound: string][];
+}
+
+let soundpacksBroken = false;
+const packName = (key: string) => wordsToTitle(wordsFromSnake(key));
+
+// The default pack maps every sound to itself, which is no source the plugin lists, and a pack that changes one sound is just
+// that sound's source, so both are left out
+export function getSoundpacks(): Soundpack[] {
+    if (soundpacksBroken) return [];
+    try {
+        const packs = Object.entries(SoundpackIds.Soundpack as Record<string, string>).flatMap(([key, pack]) => {
+            const mapped = Soundpacks.getPackSounds(pack) ?? {};
+            const sounds = soundTypes.filter(t => Object.hasOwn(t.seasonal ?? {}, mapped[t.id])).map((t): [string, string] => [t.id, mapped[t.id]]);
+            return sounds.length > 1 ? [{ key, name: packName(key), sounds }] : [];
+        });
+        if (!packs.length) throw new Error("no sound packs found");
+        return packs;
+    } catch (e) {
+        soundpacksBroken = true;
+        logger.warn("Failed to get Discord's sound packs:", e);
+        return [];
     }
 }
 
@@ -297,6 +328,7 @@ export interface ImportFilesResult {
     remap: Map<string, string>;
     imported: number;
     skipped: number;
+    ids: string[];
 }
 
 export const MAX_DATA_URI_LENGTH = Math.ceil(MAX_FILE_BYTES * 4 / 3) + 128;
@@ -434,5 +466,5 @@ export async function importAudioFiles(files: readonly Partial<ExportedAudioFile
         ids.add(id);
         if (typeof fd.id === "string" && fd.id) remap.set(fd.id, id);
     }
-    return { remap, imported: ids.size, skipped };
+    return { remap, imported: ids.size, skipped, ids: [...ids] };
 }

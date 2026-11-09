@@ -20,11 +20,11 @@ import { classes, pluralise } from "@utils/misc";
 import { wordsFromSnake, wordsToTitle } from "@utils/text";
 import definePlugin, { makeRange, OptionType, StartAt } from "@utils/types";
 import { chooseFile, saveFile } from "@utils/web";
-import { ConfirmModal, MediaEngineStore, Modal, openModal, Select, showToast, Slider, TextInput, useCallback, useEffect, useRef, useState } from "@webpack/common";
+import { ConfirmModal, ContextMenuApi, FluxDispatcher, MediaEngineStore, Menu, Modal, openModal, Select, showToast, Slider, TextInput, useCallback, useEffect, useRef, useState } from "@webpack/common";
 
-import { ACCEPTED_AUDIO, applyBoost, applyElementVolume, AudioPlayer, buildBackup, clearBoost, effectiveVolume, ExportedAudioFile, getNativeSoundName, getPlayerSinkId, importAudioFiles, isUrl, lastBaseVolume, logger, MAX_BACKUP_BYTES, mimeFor, PatchHealth, playerBaseVolume, playSound, PreviewHandle, probePatched, seasonalUrls } from "./audio";
-import { addFile, canDecode, EMPTY_SHA256, getFileUrl, isAbsent, listFiles, loadFileUrl, MAX_FILE_BYTES, removeFile, revokeFileUrls } from "./files";
-import { forgetLegacy, legacyFiles, legacyNames, migrateLegacy, unmoved } from "./migration";
+import { ACCEPTED_AUDIO, applyBoost, applyElementVolume, AudioPlayer, buildBackup, clearBoost, effectiveVolume, ExportedAudioFile, getNativeSoundName, getPlayerSinkId, getSoundpacks, importAudioFiles, isUrl, lastBaseVolume, logger, MAX_BACKUP_BYTES, mimeFor, PatchHealth, playerBaseVolume, playSound, PreviewHandle, probePatched, seasonalUrls, Soundpack } from "./audio";
+import { addFile, canDecode, EMPTY_SHA256, getFileUrl, isAbsent, listFiles, loadFileUrl, MAX_FILE_BYTES, removeAllFiles, removeFile, revokeFileUrls } from "./files";
+import { clearLegacy, forgetLegacy, hasLegacy, legacyFiles, legacyNames, migrateLegacy, unmoved } from "./migration";
 import { cleanName, DEFAULT_VOLUME, MAX_VOLUME, normalizeOverride, SoundOverride, SoundpackRequire, SoundType, soundTypes } from "./types";
 
 const cl = classNameFactory("vc-customSounds-");
@@ -66,6 +66,13 @@ function getOverride(id: string): SoundOverride {
     return o;
 }
 
+function hasSoundSettings() {
+    return soundTypes.some(t => {
+        const o = getOverride(t.id);
+        return o.enabled || o.selectedSound !== "default" || o.volume !== DEFAULT_VOLUME || !!o.selectedFileId;
+    });
+}
+
 // Older versions saved Discord's misspelled keys, which don't play anything
 const LEGACY_VARIANTS: Record<string, string> = { halloween_defean: "halloween_deafen", halloween_undefean: "halloween_undeafen" };
 function resolveLegacySeason(id: string, selected: string): string {
@@ -76,7 +83,7 @@ function resolveLegacySeason(id: string, selected: string): string {
     return soundTypes.find(t => t.id === id)?.seasonal?.[variant] ? variant : "default";
 }
 
-// Assign a copy so settings.use() picks up the change
+// A copy, so settings.use() sees the change
 function setOverride(id: string, o: SoundOverride) {
     settings.store.overrides[id] = { ...o };
 }
@@ -122,6 +129,30 @@ const soundName = (id: string) => soundTypes.find(t => t.id === id)?.name ?? id;
 const withFileName = (sound: string, file?: string) => file ? `${sound} ("${file}")` : sound;
 let importing = 0;
 let exporting = false;
+let uploadingFiles = false;
+let cardUploads = 0;
+let deletingAll = false;
+let checkingDeleteAll = false;
+const DELETE_BUSY = "Wait for the audio to finish deleting";
+
+// Vencord's chooseFile() only returns one file and never resolves when the picker is cancelled
+function chooseFiles(accept: string) {
+    return new Promise<File[]>(resolve => {
+        const input = document.createElement("input");
+        const done = (files: File[]) => {
+            input.remove();
+            resolve(files);
+        };
+        input.type = "file";
+        input.multiple = true;
+        input.accept = accept;
+        input.style.display = "none";
+        input.onchange = () => done([...input.files ?? []]);
+        input.oncancel = () => done([]);
+        document.body.appendChild(input);
+        input.click();
+    });
+}
 
 // "quiet" skips the settings store, otherwise Vencord sees newer local settings on startup and skips the cloud sync
 function backfillFileNames(stored: Record<string, string>, quiet = false) {
@@ -171,16 +202,16 @@ function describeSource(id: string, selectedSound: string): string | null {
         + (native !== id ? ` (currently ${wordsToTitle(wordsFromSnake(native))}).` : ".");
 }
 
-function SoundCard({ type, override, files, filesLoaded, onFilesChange, onFileDeleted }: {
+function SoundCard({ type, override, files, filesLoaded, onFilesChange }: {
     type: SoundType;
     override: SoundOverride;
     files: Record<string, string>;
     filesLoaded: boolean;
     onFilesChange: () => Promise<void>;
-    onFileDeleted: (id: string) => void;
 }) {
     const sound = useRef<PreviewHandle>(null);
     const previewToken = useRef(0);
+    const uploadToken = useRef(0);
 
     const stopPreview = () => {
         previewToken.current++;
@@ -189,8 +220,9 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange, onFileDe
 
     useEffect(() => stopPreview, []);
 
-    // Merge into the stored override instead of props, so saving after an await doesn't drop newer changes
+    // Reads the stored override, not the prop, so a save after an await keeps newer changes
     const save = (patch: Partial<SoundOverride>) => {
+        if (patch.selectedFileId || ("selectedSound" in patch && patch.selectedSound !== getOverride(type.id).selectedSound)) switchToNativeLater.delete(type.id);
         const next = { ...getOverride(type.id), ...patch };
         setOverride(type.id, next);
         const fileChanged = "selectedFileId" in patch || "selectedSound" in patch || "enabled" in patch;
@@ -212,7 +244,7 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange, onFileDe
         const { selectedSound, volume, selectedFileId } = override;
         if (selectedSound === "custom") {
             if (!selectedFileId) {
-                sound.current = playNative();
+                sound.current = playNative(switchToNativeLater.has(type.id) ? volume : undefined);
                 return;
             }
             const src = await loadCustom(selectedFileId);
@@ -221,36 +253,42 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange, onFileDe
         } else if (selectedSound === "default") {
             sound.current = playNative(volume);
         } else {
-            sound.current = playSound(selectedSound === "regular" ? type.id : selectedSound, { volume, baseVolume: baseVolume() });
+            sound.current = playSound(selectedSound === "regular" ? type.id : selectedSound, { volume, originalName: type.id, baseVolume: baseVolume() });
         }
     };
 
     const uploadFile = async () => {
         let file = await chooseFile(ACCEPTED_AUDIO);
         if (!file) return;
+        if (deletingAll || checkingDeleteAll) return showToast({ text: DELETE_BUSY });
         if (!file.size) return showToast({ text: "Upload failed: file is empty", variant: "critical" });
         if (file.size > MAX_FILE_BYTES) return showToast({ text: "Upload failed: file is too large (max 50 MB)", variant: "critical" });
         file = new File([file], file.name, { type: mimeFor(file.name, file.type) });
+        cardUploads++;
         try {
             showToast({ text: "Uploading file..." });
             const generation = overridesGeneration;
+            const token = ++uploadToken.current;
+            const before = getOverride(type.id);
             const added = await addFile(file);
-            if (generation === overridesGeneration)
+            const current = getOverride(type.id);
+            const selected = generation === overridesGeneration && token === uploadToken.current
+                && current.selectedSound === before.selectedSound && current.selectedFileId === before.selectedFileId;
+            if (selected)
                 save({ selectedFileId: added.id, selectedFileName: cleanName(added.existingName) ?? cleanName(file.name), selectedSound: "custom" });
             await onFilesChange();
 
             const url = await loadFileUrl(added.id).catch(() => null);
-            if (url && !await canDecode(url)) {
-                showToast({ text: "Discord can't play this file's format. Use MP3 or OGG.", variant: "critical", duration: 8000 });
-                return;
-            }
+            if (url && !await canDecode(url)) return showToast({ text: "Uploaded, but Discord can't play it. Use MP3 or OGG.", variant: "critical", duration: 8000 });
 
-            if (generation !== overridesGeneration) showToast({ text: "Uploaded, but settings changed so it wasn't selected", variant: "success" });
+            if (!selected || generation !== overridesGeneration) showToast({ text: "Uploaded, but settings changed so it wasn't selected", variant: "success" });
             else if (added.existingName) showToast({ text: "Already uploaded, using the existing file", variant: "success" });
             else showToast({ text: "File uploaded", variant: "success" });
         } catch (e) {
             logger.error("Upload failed:", e);
             showToast({ text: "Upload failed. Check console.", variant: "critical" });
+        } finally {
+            cardUploads--;
         }
     };
 
@@ -258,7 +296,7 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange, onFileDe
         try {
             await forgetLegacy(id);
             await removeFile(id);
-            onFileDeleted(id);
+            handleFileDeleted(new Set([id]));
             await onFilesChange();
             showToast({ text: "File deleted", variant: "success" });
         } catch (e) {
@@ -286,7 +324,6 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange, onFileDe
         save({ selectedFileId: id || undefined, selectedFileName });
     };
 
-    // Keep the file id so re-uploading the same file links it again
     const fileMissing = filesLoaded && override.selectedSound === "custom" && !!override.selectedFileId && !Object.hasOwn(files, override.selectedFileId);
     const fileOpts = Object.entries(files).map(([id, name]) => ({ value: id, label: name }));
     const lost = override.selectedFileName;
@@ -311,7 +348,7 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange, onFileDe
     const sourceOpts = [
         { value: "default", label: "Native" },
         { value: "regular", label: "Regular" },
-        ...Object.keys(type.seasonal ?? {}).map(id => ({ value: id, label: wordsToTitle(wordsFromSnake(id)) })),
+        ...Object.keys(type.seasonal ?? {}).map(id => ({ value: id, label: soundTypes.find(t => t.id === id)?.name ?? wordsToTitle(wordsFromSnake(id)) })),
         { value: "custom", label: "Custom" }
     ];
     const sourceHint = override.enabled ? describeSource(type.id, override.selectedSound) : null;
@@ -346,11 +383,7 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange, onFileDe
                         options={sourceOpts}
                         select={v => save({ selectedSound: v })}
                     />
-                    {sourceHint && (
-                        <Paragraph className={classes(Margins.top8, cl("muted"))} defaultColor={false}>
-                            {sourceHint}
-                        </Paragraph>
-                    )}
+                    {sourceHint && <Paragraph className={classes(Margins.top8, cl("muted"))} defaultColor={false}>{sourceHint}</Paragraph>}
                 </div>
                 {override.selectedSound === "custom" && <>
                     <Heading>Custom File</Heading>
@@ -368,16 +401,62 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange, onFileDe
                         )}
                     </div>
                     <Flex gap="8px" className={Margins.bottom16}>
-                        <Button variant="primary" onClick={uploadFile}>Upload New</Button>
+                        <Button variant="primary" onClick={uploadFile}>Upload Audio</Button>
                         {override.selectedFileId && Object.hasOwn(files, override.selectedFileId) && (
-                            <Button variant="dangerPrimary" onClick={() => deleteFile(override.selectedFileId!)}>
-                                Delete Selected File
-                            </Button>
+                            <Button variant="dangerPrimary" onClick={() => deleteFile(override.selectedFileId!)}>Delete Audio</Button>
                         )}
                     </Flex>
                 </>}
             </>}
         </Card>
+    );
+}
+
+// Sounds whose file was deleted while the settings were open stay Custom until the last settings view closes
+const switchToNativeLater = new Set<string>();
+let openSettingsViews = 0;
+function switchDeletedToNative() {
+    // A running import would see this write as the settings changing, so endImport() does it instead
+    if (importing || !switchToNativeLater.size) return;
+    const next: Record<string, SoundOverride> = { ...settings.plain.overrides };
+    let changed = false;
+    for (const id of switchToNativeLater) {
+        const o = getOverride(id);
+        if (o.selectedSound !== "custom" || o.selectedFileId) continue;
+        next[id] = { ...o, selectedSound: "default" };
+        changed = true;
+    }
+    switchToNativeLater.clear();
+    if (changed) settings.store.overrides = next;
+}
+
+function endImport() {
+    if (--importing === 0 && !openSettingsViews) switchDeletedToNative();
+}
+
+function handleFileDeleted(ids: ReadonlySet<string>) {
+    const next: Record<string, SoundOverride> = { ...settings.plain.overrides };
+    let changed = false;
+    for (const t of soundTypes) {
+        const o = getOverride(t.id);
+        if (!o.selectedFileId || !ids.has(o.selectedFileId)) continue;
+        next[t.id] = { ...o, selectedFileId: undefined, selectedFileName: undefined };
+        if (o.selectedSound === "custom") {
+            if (openSettingsViews) switchToNativeLater.add(t.id);
+            else next[t.id].selectedSound = "default";
+        }
+        changed = true;
+    }
+    if (changed) settings.store.overrides = next;
+}
+
+function MoreIcon() {
+    return (
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <circle cx="5" cy="12" r="2" />
+            <circle cx="12" cy="12" r="2" />
+            <circle cx="19" cy="12" r="2" />
+        </svg>
     );
 }
 
@@ -402,19 +481,12 @@ function SettingsUI() {
         }
     }, []);
 
-    useEffect(() => { loadFiles(); }, []);
-
-    const handleFileDeleted = useCallback((id: string) => {
-        for (const t of soundTypes) {
-            const o = getOverride(t.id);
-            if (o.selectedFileId !== id) continue;
-            setOverride(t.id, {
-                ...o,
-                selectedFileId: undefined,
-                selectedFileName: undefined,
-                selectedSound: o.selectedSound === "custom" ? "default" : o.selectedSound
-            });
-        }
+    useEffect(() => {
+        openSettingsViews++;
+        loadFiles();
+        return () => {
+            if (--openSettingsViews === 0) switchDeletedToNative();
+        };
     }, []);
 
     const resetOverrides = () => openModal(props => (
@@ -426,11 +498,152 @@ function SettingsUI() {
             onConfirm={() => {
                 overridesGeneration++;
                 settings.store.overrides = {};
+                switchToNativeLater.clear();
                 setRemountKey(k => k + 1);
                 showToast({ text: "All sound settings reset", variant: "success" });
             }}
         />
     ));
+
+    const applyPack = (pack: Soundpack) => {
+        const { name } = pack;
+        const count = pack.sounds.length;
+        const [it, its] = count === 1 ? ["it", "its"] : ["them", "their"];
+        openModal(props => (
+            <ConfirmModal
+                {...props}
+                title={`Apply the ${name} sound pack?`}
+                subtitle={`This sets ${pluralise(count, "sound")} to the ${name} version and turns ${it} on, replacing ${its} current source. Volume settings and your uploaded files are kept.`}
+                confirmText="Apply"
+                variant="primary"
+                onConfirm={() => {
+                    overridesGeneration++;
+                    const next: Record<string, SoundOverride> = { ...settings.plain.overrides };
+                    for (const [id, selectedSound] of pack.sounds) {
+                        next[id] = { ...getOverride(id), enabled: true, selectedSound };
+                        switchToNativeLater.delete(id);
+                    }
+                    settings.store.overrides = next;
+                    showToast({ text: `${clip(name, 26)} sound pack applied to ${pluralise(count, "sound")}`, variant: "success" });
+                }}
+            />
+        ));
+    };
+
+    const uploadFiles = async () => {
+        if (uploadingFiles) return showToast({ text: "Already uploading, please wait" });
+        const picked = await chooseFiles(ACCEPTED_AUDIO);
+        if (!picked.length) return;
+        if (deletingAll || checkingDeleteAll) return showToast({ text: DELETE_BUSY });
+        if (uploadingFiles) return showToast({ text: "Already uploading, please wait" });
+
+        uploadingFiles = true;
+        let uploaded = 0;
+        const existing: string[] = [];
+        const skipped: string[] = [];
+        try {
+            showToast({ text: `Uploading ${pluralise(picked.length, "file")}...` });
+            // One at a time, so a big selection never holds every file in memory at once
+            for (const chosen of picked) {
+                if (!chosen.size || chosen.size > MAX_FILE_BYTES) {
+                    skipped.push(`${chosen.name} (${chosen.size ? "over 50 MB" : "empty"})`);
+                    continue;
+                }
+                try {
+                    const probe = URL.createObjectURL(chosen);
+                    const playable = await canDecode(probe).finally(() => URL.revokeObjectURL(probe));
+                    if (!playable) {
+                        skipped.push(`${chosen.name} (Discord can't play it, use MP3 or OGG)`);
+                        continue;
+                    }
+                    const added = await addFile(new File([chosen], chosen.name, { type: mimeFor(chosen.name, chosen.type) }));
+                    uploaded++;
+                    if (added.existingName) existing.push(chosen.name);
+                } catch (e) {
+                    logger.error(`Upload failed for "${chosen.name}":`, e);
+                    skipped.push(`${chosen.name} (failed)`);
+                }
+            }
+            await loadFiles();
+        } finally {
+            uploadingFiles = false;
+        }
+
+        if (existing.length) logger.info(`Upload: these files were already uploaded: ${existing.join(", ")}`);
+        if (skipped.length) logger.warn(`Upload: skipped ${skipped.join(", ")}`);
+        if (!uploaded) return showToast({ text: `Couldn't upload ${pluralise(skipped.length, "file")}. Check console.`, variant: "critical", duration: 8000 });
+        const added = uploaded - existing.length;
+        let text = added ? `Uploaded ${pluralise(added, "file")}` : skipped.length ? `${pluralise(existing.length, "file")} already uploaded`
+            : existing.length === 1 ? "This file was already uploaded" : `These ${existing.length} files were already uploaded`;
+        if (added && existing.length && !skipped.length) text += `, ${existing.length} already uploaded`;
+        if (skipped.length) showToast({ text: `${text}, ${skipped.length} skipped. Check console.`, variant: "critical", duration: 8000 });
+        else showToast({ text, variant: "success" });
+    };
+
+    const busy = () => importing || exporting || uploadingFiles || cardUploads > 0;
+    const BUSY = "Wait for the import, export or upload to finish";
+
+    const deleteAllFiles = async () => {
+        if (deletingAll || checkingDeleteAll) return showToast({ text: "Already deleting, please wait" });
+        if (busy()) return showToast({ text: BUSY });
+
+        let count: number;
+        checkingDeleteAll = true;
+        try {
+            // Wait for the startup migration, or files it hasn't copied yet would be left out of the count
+            await migrateLegacy();
+            count = new Set([...Object.keys(await listFiles()), ...unmoved]).size;
+            if (!count && !await hasLegacy()) return showToast({ text: "No uploaded audio to delete" });
+        } catch (e) {
+            logger.error("Delete all failed:", e);
+            return showToast({ text: "Delete failed. Check console.", variant: "critical" });
+        } finally {
+            checkingDeleteAll = false;
+        }
+
+        openModal(props => (
+            <ConfirmModal
+                {...props}
+                title="Delete all uploaded audio?"
+                subtitle={`This deletes ${count ? pluralise(count, "uploaded audio file") : "the old sound storage"} from this device and can't be undone, so use Export backup first if you want a copy. `
+                    + "Sounds that use this audio switch to Native when you close these settings. With settings sync on, they switch on your other devices too, but the audio stored there isn't deleted."}
+                confirmText="Delete All"
+                onConfirm={async () => {
+                    if (deletingAll) return showToast({ text: "Already deleting, please wait" });
+                    if (busy()) return showToast({ text: BUSY });
+                    deletingAll = true;
+                    // Stops an upload that's still finishing from selecting a file that's about to be deleted
+                    overridesGeneration++;
+                    const deleted = new Set<string>();
+                    let ok = true;
+                    try {
+                        try {
+                            for (const id of await clearLegacy()) deleted.add(id);
+                            clearTimeout(migrationNoticeTimer);
+                            for (const id of await removeAllFiles()) deleted.add(id);
+                        } catch (e) {
+                            ok = false;
+                            logger.error("Delete all failed:", e);
+                            const left = await listFiles().catch(() => null);
+                            if (!left) deleted.clear();
+                            else for (const id of Object.keys(left)) deleted.delete(id);
+                        }
+                        try {
+                            if (deleted.size) handleFileDeleted(deleted);
+                        } catch (e) {
+                            ok = false;
+                            logger.error("Delete all failed:", e);
+                        }
+                    } finally {
+                        deletingAll = false;
+                    }
+                    await loadFiles();
+                    if (ok) showToast({ text: "All uploaded audio deleted", variant: "success" });
+                    else showToast({ text: "Delete failed. Check console.", variant: "critical" });
+                }}
+            />
+        ));
+    };
 
     const applyImport = async (
         sanitized: OverrideEntry[],
@@ -443,16 +656,16 @@ function SettingsUI() {
         try {
             let gen = overridesGeneration;
             let before = "";
+            const hadSettings = hasSoundSettings();
             if (applyOverrides) {
                 gen = ++overridesGeneration;
                 before = JSON.stringify(settings.store.overrides ?? {});
             }
 
-            const { remap, imported, skipped } = await importAudioFiles(fileEntries);
-            if (allInvalid && !imported) {
-                showToast({ text: "Import failed: no CustomSounds data in this file", variant: "critical" });
-                return;
-            }
+            const storedBefore = await listFiles();
+            const { remap, imported, skipped, ids } = await importAudioFiles(fileEntries);
+            const newFiles = ids.filter(id => !Object.hasOwn(storedBefore, id)).length;
+            if (allInvalid && !imported) return showToast({ text: "Import failed: no CustomSounds data in this file", variant: "critical" });
 
             const moved = await migrateLegacy();
             const available = await listFiles();
@@ -506,31 +719,40 @@ function SettingsUI() {
 
             let applied = false;
             if (applyOverrides) {
-                if (gen !== overridesGeneration || JSON.stringify(settings.store.overrides ?? {}) !== before) {
-                    showToast({ text: "Files imported, but settings changed. Import again.", duration: 8000 });
-                    return;
-                }
+                if (gen !== overridesGeneration || JSON.stringify(settings.store.overrides ?? {}) !== before)
+                    return showToast({ text: imported ? "Files imported, but settings changed. Import again." : "Settings changed during the import. Import again.", duration: 8000 });
                 overridesGeneration++;
                 settings.store.overrides = next;
+                switchToNativeLater.clear();
                 setRemountKey(k => k + 1);
                 applied = true;
             }
 
             const needsFiles = awaitingFile.length > 0 || switchedToNative.length > 0;
+            const filesOnly = !applied || (!sanitized.length && !hadSettings);
+            if (filesOnly && !imported) {
+                showToast(skipped
+                    ? { text: `Couldn't import ${pluralise(skipped, "file")}. Check console.`, variant: "critical", duration: 8000 }
+                    : { text: "Nothing to import in this backup" });
+                return;
+            }
             let text: string;
-            if (!applied && imported) text = `Imported ${pluralise(imported, "file")} without sound settings`;
+            if (filesOnly) text = newFiles ? `Imported ${pluralise(newFiles, "new file")} without settings`
+                : skipped ? "No new files imported" : "All files in this backup were already uploaded";
+            else if (!sanitized.length) text = newFiles ? `Reset settings and imported ${pluralise(newFiles, "new file")}` : "Reset your sound settings";
             else if (noAudio) text = `Imported ${pluralise(sanitized.length, "setting")}, but the backup has no audio`;
-            else text = `Imported ${pluralise(sanitized.length, "setting")} and ${pluralise(imported, "file")}`;
-            if (skipped) text += ` (${skipped} failed)`;
+            else if (newFiles) text = `Imported ${pluralise(sanitized.length, "setting")} and ${pluralise(newFiles, "new file")}`;
+            else text = `Imported ${pluralise(sanitized.length, "setting")}`;
+            if (skipped) text += ` (${pluralise(skipped, "file")} failed)`;
             showToast({ text, variant: skipped || needsFiles ? "default" : "success", duration: needsFiles ? 8000 : undefined });
             if (applied && boosted) showToast({ text: `${pluralise(boosted, "imported sound")} set above ${DEFAULT_VOLUME}%` });
 
             const lines: string[] = [];
             if (noAudio && needsFiles) lines.push("This backup is from an older CustomSounds version or from Equicord, so it has no audio files.");
-            if (awaitingFile.length) lines.push(`These sounds need their file uploaded again: ${awaitingFile.join(", ")}.`);
+            if (awaitingFile.length) lines.push(`${awaitingFile.length === 1 ? "This sound needs its" : "These sounds need their"} file uploaded again: ${awaitingFile.join(", ")}.`);
             if (keptCurrent.length) lines.push(`Kept your current file because the backup's file isn't on this device: ${keptCurrent.join(", ")}.`);
-            if (switchedToNative.length) lines.push(`These sounds lost their file and now use Native: ${switchedToNative.join(", ")}.`);
-            if (needsFiles) lines.push("After uploading them, Export again so your backup includes the audio.");
+            if (switchedToNative.length) lines.push(`${switchedToNative.length === 1 ? "This sound lost its file and now uses" : "These sounds lost their file and now use"} Native: ${switchedToNative.join(", ")}.`);
+            if (needsFiles) lines.push("After uploading the missing files, use Export backup again so your backup includes the audio.");
             if (applied && lines.length) openModal(props => (
                 <Modal
                     {...props}
@@ -544,21 +766,18 @@ function SettingsUI() {
             logger.error("Import failed:", e);
             showToast({ text: `Import failed: ${e instanceof Error ? e.message : "check console"}`, variant: "critical" });
         } finally {
-            importing--;
+            endImport();
         }
     };
 
     const handleSettingsUpload = async () => {
         const file = importing ? null : await chooseFile("application/json,.json");
-        // One at a time, since each import keeps a whole backup in memory
         if (importing) return showToast({ text: "Already importing, please wait" });
         if (!file) return;
+        if (deletingAll || checkingDeleteAll) return showToast({ text: DELETE_BUSY });
         importing++;
         try {
-            if (file.size > MAX_BACKUP_BYTES) {
-                showToast({ text: "Import failed: file is too large (max 500 MB)", variant: "critical" });
-                return;
-            }
+            if (file.size > MAX_BACKUP_BYTES) return showToast({ text: "Import failed: file is too large (max 500 MB)", variant: "critical" });
             showToast({ text: "Importing..." });
             const json = await file.text();
             let imp: any;
@@ -599,34 +818,44 @@ function SettingsUI() {
             const allInvalid = !!importedOverrides && importedOverrides.length > 0 && sanitized.length === 0;
 
             const run = () => applyImport(sanitized, fileEntries, applyOverrides, noAudio, allInvalid);
-            const hasCurrent = soundTypes.some(t => {
-                const o = getOverride(t.id);
-                return o.enabled || o.selectedSound !== "default" || o.volume !== DEFAULT_VOLUME;
-            });
-            if (applyOverrides && hasCurrent) openModal(props => (
-                <ConfirmModal
-                    {...props}
-                    title="Replace your sound settings?"
-                    subtitle={`This replaces your current sound settings with the ${pluralise(sanitized.length, "sound")} in this backup. Your uploaded files are kept.`}
-                    confirmText="Import"
-                    variant="primary"
-                    onConfirm={() => {
-                        showToast({ text: "Importing..." });
-                        void run();
-                    }}
-                />
-            ));
-            else await run();
+            if (applyOverrides && hasSoundSettings()) {
+                const stored = await listFiles();
+                const newFiles = new Set(fileEntries
+                    .filter(fd => typeof fd.dataUri === "string" && !(typeof fd.id === "string" && HASH_ID.test(fd.id) && Object.hasOwn(stored, fd.id)))
+                    .map((fd, i) => typeof fd.id === "string" && fd.id ? fd.id : `#${i}`)).size;
+                openModal(props => (
+                    <ConfirmModal
+                        {...props}
+                        title="Replace your sound settings?"
+                        subtitle={(sanitized.length
+                            ? `This replaces your current sound settings with the ${pluralise(sanitized.length, "sound")} in this backup`
+                            : "This backup has no sound settings, so importing it resets yours")
+                            + (newFiles ? ` and adds ${pluralise(newFiles, "new audio file")}.` : ". It has no new audio files.")
+                            + " Your uploaded files are kept."}
+                        confirmText="Import"
+                        variant="primary"
+                        onConfirm={() => {
+                            if (importing) return showToast({ text: "Already importing, please wait" });
+                            if (deletingAll || checkingDeleteAll) return showToast({ text: DELETE_BUSY });
+                            showToast({ text: "Importing..." });
+                            void run();
+                        }}
+                    />
+                ));
+            } else {
+                await run();
+            }
         } catch (e) {
             logger.error("Import failed:", e);
             showToast({ text: `Import failed: ${e instanceof Error ? e.message : "check console"}`, variant: "critical" });
         } finally {
-            importing--;
+            endImport();
         }
     };
 
     const downloadSettings = async () => {
         if (exporting) return showToast({ text: "Already exporting, please wait" });
+        if (deletingAll) return showToast({ text: DELETE_BUSY });
         exporting = true;
         const saved: string[] = [];
         try {
@@ -634,11 +863,12 @@ function SettingsUI() {
             const overrides = soundTypes
                 .map(t => {
                     const o = getOverride(t.id);
-                    const fileId = o.selectedSound === "custom" ? o.selectedFileId : undefined;
+                    const selectedSound = o.selectedSound === "custom" && !o.selectedFileId && switchToNativeLater.has(t.id) ? "default" : o.selectedSound;
+                    const fileId = selectedSound === "custom" ? o.selectedFileId : undefined;
                     return {
                         id: t.id,
                         enabled: o.enabled,
-                        selectedSound: o.selectedSound,
+                        selectedSound,
                         selectedFileId: fileId,
                         selectedFileName: fileId && (o.selectedFileName ?? (files && Object.hasOwn(files, fileId) ? cleanName(files[fileId]) : undefined)),
                         volume: o.volume
@@ -702,6 +932,28 @@ function SettingsUI() {
         }
     };
 
+    const openSettingsMenu = (e: React.MouseEvent) => {
+        const packs = getSoundpacks();
+        ContextMenuApi.openContextMenu(e, () => (
+            <Menu.Menu
+                navId="vc-customsounds-settings"
+                onClose={() => FluxDispatcher.dispatch({ type: "CONTEXT_MENU_CLOSE" })}
+                aria-label="CustomSounds options"
+            >
+                {packs.length > 0 && (
+                    <Menu.MenuItem id="vc-customsounds-packs" label="Apply sound pack">
+                        {packs.map(p => <Menu.MenuItem key={p.key} id={`vc-customsounds-pack-${p.key}`} label={p.name} action={() => applyPack(p)} />)}
+                    </Menu.MenuItem>
+                )}
+                <Menu.MenuItem id="vc-customsounds-import" label="Import backup" action={handleSettingsUpload} />
+                <Menu.MenuItem id="vc-customsounds-export" label="Export backup" action={downloadSettings} />
+                <Menu.MenuSeparator />
+                <Menu.MenuItem id="vc-customsounds-reset" label="Reset all sound settings" color="danger" action={resetOverrides} />
+                <Menu.MenuItem id="vc-customsounds-delete-all" label="Delete all audio" color="danger" action={deleteAllFiles} />
+            </Menu.Menu>
+        ));
+    };
+
     const q = query.trim().toLowerCase();
     const shownTypes = q ? soundTypes.filter(t => t.name.toLowerCase().includes(q) || t.id.includes(q)) : soundTypes;
 
@@ -717,13 +969,14 @@ function SettingsUI() {
                     <Paragraph>{HEALTH_MESSAGES[health]}</Paragraph>
                 </Card>
             )}
-            <Flex gap="8px" className={Margins.bottom16}>
-                <Button variant="primary" onClick={handleSettingsUpload}>Import</Button>
-                <Button variant="secondary" onClick={downloadSettings}>Export</Button>
-                <Button variant="dangerPrimary" onClick={resetOverrides}>Reset All</Button>
+            <Flex gap="8px" alignItems="center" className={Margins.bottom16}>
+                <Button variant="primary" onClick={uploadFiles}>Upload Audio</Button>
+                <Button variant="secondary" size="iconOnly" aria-label="More options" aria-haspopup="menu" onClick={openSettingsMenu}>
+                    <MoreIcon />
+                </Button>
             </Flex>
             <div className={Margins.bottom16}>
-                <TextInput value={query} onChange={setQuery} placeholder="Search sounds by name or id" />
+                <TextInput value={query} onChange={setQuery} placeholder="Search sounds by name or ID" />
             </div>
             <Flex flexDirection="column" gap="16px">
                 {shownTypes.map(type => (
@@ -734,7 +987,6 @@ function SettingsUI() {
                         files={files ?? {}}
                         filesLoaded={files !== null}
                         onFilesChange={loadFiles}
-                        onFileDeleted={handleFileDeleted}
                     />
                 ))}
                 {!shownTypes.length && <Paragraph className={cl("muted")} defaultColor={false}>No sounds match "{query}".</Paragraph>}
@@ -802,13 +1054,18 @@ export default definePlugin({
         if (typeof originalName === "string") player.__csOriginalName = originalName;
     },
 
-    // Sound packs rename the player, so check the mapped name first, then the original id
+    // Sound packs rename the player. A source picked for the original sound wins, then the mapped name's card, then the original id
     getActiveOverride(player: AudioPlayer): OverrideEntry | null {
         const { name } = player;
         if (typeof name !== "string" || isUrl(name)) return null;
         const canonical = player.__csOriginalName !== name ? player.__csOriginalName : undefined;
         const original = canonical ? getOverride(canonical) : undefined;
-        if (canonical && original?.enabled && original.selectedSound === "regular") return { ...original, id: canonical };
+        if (canonical && original?.enabled) {
+            const s = original.selectedSound;
+            const ownPick = s === "custom" ? !!original.selectedFileId && !isAbsent(original.selectedFileId)
+                : s === "regular" || Object.hasOwn(soundTypes.find(t => t.id === canonical)?.seasonal ?? {}, s);
+            if (ownPick) return { ...original, id: canonical };
+        }
         const mapped = getOverride(name);
         if (mapped.enabled) return { ...mapped, id: name };
         if (canonical && original?.enabled) return { ...original, id: canonical };
@@ -818,7 +1075,9 @@ export default definePlugin({
     getVolumeOverride(player: AudioPlayer): number | null {
         if (player.__csPreviewVolume != null) return player.__csPreviewVolume;
         const o = this.getActiveOverride(player);
-        if (!o || (o.selectedSound === "custom" && (!o.selectedFileId || isAbsent(o.selectedFileId)))) return null;
+        if (!o) return null;
+        if (o.selectedSound === "custom" && !o.selectedFileId && switchToNativeLater.has(o.id)) return o.volume;
+        if (o.selectedSound === "custom" && (!o.selectedFileId || isAbsent(o.selectedFileId))) return null;
         return o.volume;
     },
 
@@ -886,7 +1145,6 @@ export default definePlugin({
         return vanillaVolume;
     },
 
-    // Returns true if handled, false lets Discord set the volume
     setVolume(player: AudioPlayer, volume: number): boolean {
         try {
             const pct = this.getVolumeOverride(player);
@@ -915,17 +1173,16 @@ export default definePlugin({
 
     handleAudioError(player: AudioPlayer, audio: HTMLAudioElement & { __csTriedFallback?: boolean; }): boolean {
         try {
-            if (!audio.__csTriedFallback && player.__csDefaultSrc) {
+            if (audio.__csTriedFallback) return false;
+            if (player.__csDefaultSrc) {
                 audio.__csTriedFallback = true;
                 logger.warn(`Override for "${player.name}" failed to load, falling back to the default sound`);
                 audio.src = player.__csDefaultSrc;
                 audio.load();
                 return true;
             }
-            if (!audio.__csTriedFallback) {
-                logger.warn(`Sound "${player.name}" failed to load and has no fallback. src: ${audio.currentSrc || audio.src}`);
-                if (player.__csPreviewVolume != null) showToast({ text: "Failed to load this sound", variant: "critical" });
-            }
+            logger.warn(`Sound "${player.name}" failed to load and has no fallback. src: ${audio.currentSrc || audio.src}`);
+            if (player.__csPreviewVolume != null) showToast({ text: "Failed to load this sound", variant: "critical" });
             return false;
         } catch (e) {
             logger.error("Failed to handle a sound load error:", e);
@@ -974,7 +1231,10 @@ export default definePlugin({
         if (missingSounds.length)
             logger.info(`No file on this device for ${pluralise(missingSounds.length, "sound")}, Discord plays its own sound instead:`, missingSounds.join(", "));
         if (!migrated)
-            migrationNoticeTimer = setTimeout(() => showToast({ text: "CustomSounds: files not moved. Don't clear Discord's data.", variant: "critical", duration: 10000 }), healthDelays[0]);
+            migrationNoticeTimer = setTimeout(async () => {
+                if (!await migrateLegacy())
+                    showToast({ text: "CustomSounds: files not moved. Don't clear Discord's data.", variant: "critical", duration: 10000 });
+            }, healthDelays[0]);
     },
 
     stop() {
