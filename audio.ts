@@ -9,7 +9,7 @@ import { wordsFromSnake, wordsToTitle } from "@utils/text";
 import { findByCodeLazy, findByPropsLazy, findStoreLazy, mapMangledModuleLazy } from "@webpack";
 import { MediaEngineStore } from "@webpack/common";
 
-import { addFile, blobHash, getFile, hasAudio, MAX_FILE_BYTES, StoredFile } from "./files";
+import { addFile, getFile, hasAudio, MAX_FILE_BYTES, mimeFor } from "./files";
 import { DEFAULT_VOLUME, soundTypes } from "./types";
 
 export const logger = new Logger("CustomSounds");
@@ -37,7 +37,6 @@ export interface AudioPlayer {
     volume: number;
     play(): void;
     stop(): void;
-    ensureAudio(): Promise<HTMLAudioElement>;
     __csPatched?: boolean;
     __csOriginalName?: string;
     __csPreviewVolume?: number;
@@ -177,10 +176,10 @@ export function effectiveVolume(volumePct: number, outputVolume: number, baseVol
     return Math.max(0, outputVolume / 100 * baseVolume * (volumePct / 100));
 }
 
-export function applyElementVolume(audio: HTMLAudioElement, volumePct: number, outputVolume: number, sinkId: string, baseVolume: number) {
-    const effective = effectiveVolume(volumePct, outputVolume, baseVolume);
+export function applyElementVolume(player: AudioPlayer, audio: HTMLAudioElement, volumePct: number) {
+    const effective = effectiveVolume(volumePct, MediaEngineStore.getOutputVolume(), playerBaseVolume(player));
     audio.volume = Math.min(1, effective);
-    applyBoost(audio, effective, sinkId);
+    applyBoost(audio, effective, getPlayerSinkId(player));
 }
 
 export function playerBaseVolume(player: AudioPlayer): number {
@@ -213,7 +212,6 @@ export interface Soundpack {
 }
 
 let soundpacksBroken = false;
-const packName = (key: string) => wordsToTitle(wordsFromSnake(key));
 
 // The default pack maps every sound to itself, which is no source the plugin lists, and a pack that changes one sound is just
 // that sound's source, so both are left out
@@ -223,7 +221,7 @@ export function getSoundpacks(): Soundpack[] {
         const packs = Object.entries(SoundpackIds.Soundpack as Record<string, string>).flatMap(([key, pack]) => {
             const mapped = Soundpacks.getPackSounds(pack) ?? {};
             const sounds = soundTypes.filter(t => Object.hasOwn(t.seasonal ?? {}, mapped[t.id])).map((t): [string, string] => [t.id, mapped[t.id]]);
-            return sounds.length > 1 ? [{ key, name: packName(key), sounds }] : [];
+            return sounds.length > 1 ? [{ key, name: wordsToTitle(wordsFromSnake(key)), sounds }] : [];
         });
         if (!packs.length) throw new Error("no sound packs found");
         return packs;
@@ -235,19 +233,20 @@ export function getSoundpacks(): Soundpack[] {
 }
 
 export function playSound(sound: string, opts: { volume?: number; originalName?: string; baseVolume?: number; }): PreviewHandle {
+    const volume = opts.volume ?? DEFAULT_VOLUME;
     let player: AudioPlayer;
     try {
-        player = new WebAudioSound(sound, opts.originalName ?? sound, toElementVolume(opts.volume ?? DEFAULT_VOLUME), "default");
+        player = new WebAudioSound(sound, opts.originalName ?? sound, toElementVolume(volume), "default");
     } catch (e) {
         logger.error("Failed to create audio player:", e);
-        return playFallback(sound, opts);
+        return playFallback(sound, volume);
     }
 
     const patched = !!player.__csPatched;
-    if (!patched && isUrl(sound)) return playFallback(sound, opts);
+    if (!patched && isUrl(sound)) return playFallback(sound, volume);
 
     if (patched) {
-        player.__csPreviewVolume = Math.max(0, opts.volume ?? DEFAULT_VOLUME);
+        player.__csPreviewVolume = volume;
         player.__csPreviewBase = opts.baseVolume ?? 1;
     } else {
         logger.warn("Audio patch isn't applied, previewing the default sound");
@@ -272,49 +271,28 @@ export function playSound(sound: string, opts: { volume?: number; originalName?:
                 player.volume = toElementVolume(pct);
                 return;
             }
-            const volume = Math.max(0, pct);
-            player.__csPreviewVolume = volume;
+            player.__csPreviewVolume = pct;
             player._audio
-                ?.then(audio => applyElementVolume(audio, volume, MediaEngineStore.getOutputVolume(), getPlayerSinkId(player), playerBaseVolume(player)))
+                ?.then(audio => applyElementVolume(player, audio, pct))
                 .catch(e => logger.warn("Failed to set preview volume:", e));
         }
     };
 }
 
-function playFallback(sound: string, opts: { volume?: number; }): PreviewHandle {
+function playFallback(sound: string, volume: number): PreviewHandle {
     const src = seasonalUrls.get(sound) ?? sound;
-    let audio: HTMLAudioElement | null = null;
-    if (isUrl(src)) {
-        audio = new Audio(src);
-        audio.volume = toElementVolume(opts.volume ?? DEFAULT_VOLUME);
-        audio.onerror = () => logger.warn(`Failed to load preview: ${src}`);
-        audio.play().catch(e => logger.warn("Failed to play preview:", e));
-    } else {
+    if (!isUrl(src)) {
         logger.warn("Audio patch isn't applied, can't preview this sound");
+        return { stop() { }, setVolume() { } };
     }
-
+    const audio = new Audio(src);
+    audio.volume = toElementVolume(volume);
+    audio.onerror = () => logger.warn(`Failed to load preview: ${src}`);
+    audio.play().catch(e => logger.warn("Failed to play preview:", e));
     return {
-        stop: () => {
-            if (!audio) return;
-            audio.pause();
-            audio.currentTime = 0;
-        },
-        setVolume: pct => {
-            if (audio) audio.volume = toElementVolume(pct);
-        }
+        stop: () => audio.pause(),
+        setVolume: pct => { audio.volume = toElementVolume(pct); }
     };
-}
-
-export const ACCEPTED_AUDIO = ".mp3,.wav,.ogg,.oga,.opus,.m4a,.flac,.aac,.webm,.mp4";
-const MIME_BY_EXT: Record<string, string> = {
-    mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", oga: "audio/ogg", opus: "audio/ogg",
-    m4a: "audio/mp4", mp4: "audio/mp4", flac: "audio/flac", aac: "audio/aac", webm: "audio/webm"
-};
-export function mimeFor(name: string, type: unknown): string {
-    // Backups store the type in a data URI, so it can't contain , or ;
-    if (typeof type === "string" && /^[\w.+-]+\/[\w.+-]{1,100}$/.test(type) && type !== "application/octet-stream") return type;
-    const ext = name.split(".").pop()?.toLowerCase() ?? "";
-    return Object.hasOwn(MIME_BY_EXT, ext) ? MIME_BY_EXT[ext] : "audio/mpeg";
 }
 
 export interface ExportedAudioFile {
@@ -322,13 +300,6 @@ export interface ExportedAudioFile {
     name: string;
     type: string;
     dataUri: string;
-}
-
-export interface ImportFilesResult {
-    remap: Map<string, string>;
-    imported: number;
-    skipped: number;
-    ids: string[];
 }
 
 export const MAX_DATA_URI_LENGTH = Math.ceil(MAX_FILE_BYTES * 4 / 3) + 128;
@@ -366,7 +337,7 @@ export function blobToDataUri(blob: Blob) {
 
 // Non-ASCII is escaped so the backup is one byte per character
 // Files that don't fit in this backup go in `rest` for the next part, files too big for any part go in `left`
-export async function buildBackup(head: object, ids: Iterable<string>, old?: ReadonlyMap<string, StoredFile>) {
+export async function buildBackup(head: object, ids: Iterable<string>) {
     const ascii = (s: string) => s.replace(/[\u007f-\uffff]/g, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
     const tail = "\n  ]\n}\n";
     const parts: BlobPart[] = [ascii(JSON.stringify(head, null, 2)).slice(0, -2) + ',\n  "files": ['];
@@ -376,12 +347,9 @@ export async function buildBackup(head: object, ids: Iterable<string>, old?: Rea
     let unbundled = 0;
     const left: string[] = [];
     const rest: string[] = [];
-    const fromOld: string[] = [];
 
     for (const id of new Set(ids)) {
-        const own = await getFile(id).catch(e => void logger.warn(`Export: failed to read file ${id}:`, e));
-        const isOld = !!old?.has(id) && await blobHash(own?.blob) !== id;
-        const file = isOld ? old?.get(id) : own;
+        const file = await getFile(id).catch(e => void logger.warn(`Export: failed to read file ${id}:`, e));
         if (!hasAudio(file)) {
             unbundled++;
             continue;
@@ -405,11 +373,6 @@ export async function buildBackup(head: object, ids: Iterable<string>, old?: Rea
 
         const header = `data:${mimeFor(name, file.blob.type.slice(0, 100))};base64,`;
         const body = dataUri.slice(dataUri.lastIndexOf(",") + 1);
-        if (header.length + body.length > MAX_DATA_URI_LENGTH) {
-            left.push(name);
-            continue;
-        }
-
         const meta = ascii(JSON.stringify({ id, name, type: file.blob.type, dataUri: "" })).slice(0, -2);
         const part = new Blob([`${bundled ? "," : ""}\n    ${meta}${header}`, body, "\"}"]);
         if (total + part.size > MAX_BACKUP_BYTES) {
@@ -422,14 +385,13 @@ export async function buildBackup(head: object, ids: Iterable<string>, old?: Rea
         total += part.size;
         audioBytes += file.blob.size;
         bundled++;
-        if (isOld) fromOld.push(name);
     }
 
     parts.push(tail);
-    return { backup: new Blob(parts, { type: "application/json" }), size: total, bundled, unbundled, left, rest, fromOld };
+    return { backup: new Blob(parts, { type: "application/json" }), size: total, bundled, unbundled, left, rest };
 }
 
-export async function importAudioFiles(files: readonly Partial<ExportedAudioFile>[]): Promise<ImportFilesResult> {
+export async function importAudioFiles(files: readonly Partial<ExportedAudioFile>[]) {
     const remap = new Map<string, string>();
     const ids = new Set<string>();
     let skipped = 0;

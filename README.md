@@ -15,7 +15,7 @@ Each sound can play **Native** (whatever Discord would play, including sound pac
 
 ## Updating from an older version
 
-This version stores your files in a new place. On first start it copies your old files over and checks them, and the old storage is deleted once everything has been moved. If copying fails, nothing is deleted and it tries again on the next start, so don't clear Discord's data.
+Older versions of this plugin kept your sound files in a different storage. This version no longer reads that storage. The old files stay there unused. Sounds whose file was only there play Discord's own sound until you upload the file again or import a backup that includes it. Sound settings saved by the oldest versions aren't converted either, so set those sounds up again.
 
 Equicord's CustomSounds and older versions of this plugin can't read the new storage. To switch back, use **Export backup** first and import that backup in the version you're switching to.
 
@@ -48,7 +48,6 @@ The full cloning installation guide can be found [here](https://discord.com/chan
 ## Troubleshooting
 
 - **Previews work but real sounds don't change:** A Discord update probably broke the plugin. Check its settings for a red warning, then update Vencord and the plugin.
-- **The console says _Failed to move the old sound storage_ on every start:** Close Discord and back up its `IndexedDB` folder (Windows: `%appdata%\discord\IndexedDB`, Vesktop: `%appdata%\vesktop\sessionData\IndexedDB`, macOS/Linux: the same folders under `~/Library/Application Support` or `~/.config`). Then reopen Discord and run `Vencord.Api.DataStore.delMany(["ScattrdCustomSounds", "ScattrdCustomSounds_Metadata"])` in the console. This deletes the old storage, including any files that weren't moved.
 - **Incoming calls don't ring:** Check that Discord's _Incoming Ring_ sound is on and that you replaced _Call Ringing_ (incoming), not _Call Calling_ (outgoing).
 - _Message 1_ plays for every message notification, including DMs and pings. Discord never plays _Mention 1_ or _Mention 2_.
 - Sounds that macOS plays through native notifications can't be changed.

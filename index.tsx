@@ -6,7 +6,7 @@
 
 import "./styles.css";
 
-import { definePluginSettings, SettingsStore } from "@api/Settings";
+import { definePluginSettings } from "@api/Settings";
 import { Button } from "@components/Button";
 import { Card } from "@components/Card";
 import { Flex } from "@components/Flex";
@@ -19,12 +19,11 @@ import { classNameFactory } from "@utils/css";
 import { classes, pluralise } from "@utils/misc";
 import { wordsFromSnake, wordsToTitle } from "@utils/text";
 import definePlugin, { makeRange, OptionType, StartAt } from "@utils/types";
-import { chooseFile, saveFile } from "@utils/web";
-import { ConfirmModal, ContextMenuApi, FluxDispatcher, MediaEngineStore, Menu, Modal, openModal, Select, showToast, Slider, TextInput, useCallback, useEffect, useRef, useState } from "@webpack/common";
+import { saveFile } from "@utils/web";
+import { ConfirmModal, ContextMenuApi, Menu, Modal, openModal, Select, showToast, Slider, TextInput, useEffect, useRef, useState } from "@webpack/common";
 
-import { ACCEPTED_AUDIO, applyBoost, applyElementVolume, AudioPlayer, buildBackup, clearBoost, effectiveVolume, ExportedAudioFile, getNativeSoundName, getPlayerSinkId, getSoundpacks, importAudioFiles, isUrl, lastBaseVolume, logger, MAX_BACKUP_BYTES, mimeFor, PatchHealth, playerBaseVolume, playSound, PreviewHandle, probePatched, seasonalUrls, Soundpack } from "./audio";
-import { addFile, canDecode, EMPTY_SHA256, getFileUrl, isAbsent, listFiles, loadFileUrl, MAX_FILE_BYTES, removeAllFiles, removeFile, revokeFileUrls } from "./files";
-import { clearLegacy, forgetLegacy, hasLegacy, legacyFiles, legacyNames, migrateLegacy, unmoved } from "./migration";
+import { applyBoost, applyElementVolume, AudioPlayer, buildBackup, clearBoost, effectiveVolume, ExportedAudioFile, getNativeSoundName, getPlayerSinkId, getSoundpacks, importAudioFiles, isUrl, lastBaseVolume, logger, MAX_BACKUP_BYTES, PatchHealth, playerBaseVolume, playSound, PreviewHandle, probePatched, seasonalUrls, Soundpack } from "./audio";
+import { ACCEPTED_AUDIO, addFile, canDecode, getFileUrl, isAbsent, listFiles, loadFileUrl, MAX_FILE_BYTES, removeAllFiles, removeFile } from "./files";
 import { cleanName, DEFAULT_VOLUME, MAX_VOLUME, normalizeOverride, SoundOverride, SoundpackRequire, SoundType, soundTypes } from "./types";
 
 const cl = classNameFactory("vc-customSounds-");
@@ -40,29 +39,17 @@ const settings = definePluginSettings({
     }
 });
 
-function migrateLegacySettings() {
-    const plain = settings.plain as Record<string, unknown> & { overrides?: Record<string, SoundOverride>; };
-    const target = (plain.overrides ??= {});
-    if (!target || typeof target !== "object") return;
-    let changed = false;
-    for (const t of soundTypes) {
-        const stored = plain[t.id];
-        if (stored === undefined) continue;
-        try {
-            const parsed = typeof stored === "string" ? JSON.parse(stored) : stored;
-            if (parsed && typeof parsed === "object" && !(t.id in target)) target[t.id] = parsed;
-        } catch (e) {
-            logger.warn(`Failed to migrate the old setting for "${t.id}", it was reset:`, e);
-        }
-        delete plain[t.id];
-        changed = true;
-    }
-    if (changed) SettingsStore.markAsChanged();
+const soundsById = new Map(soundTypes.map(t => [t.id, t]));
+
+function isSource(id: string, sound: string) {
+    return sound === "default" || sound === "regular" || sound === "custom"
+        || Object.hasOwn(soundsById.get(id)?.seasonal ?? {}, sound);
 }
 
+// A source this sound doesn't have plays as Native
 function getOverride(id: string): SoundOverride {
     const o = normalizeOverride(settings.store.overrides?.[id]);
-    o.selectedSound = resolveLegacySeason(id, o.selectedSound);
+    if (!isSource(id, o.selectedSound)) o.selectedSound = "default";
     return o;
 }
 
@@ -73,19 +60,13 @@ function hasSoundSettings() {
     });
 }
 
-// Older versions saved Discord's misspelled keys, which don't play anything
-const LEGACY_VARIANTS: Record<string, string> = { halloween_defean: "halloween_deafen", halloween_undefean: "halloween_undeafen" };
-function resolveLegacySeason(id: string, selected: string): string {
-    let variant: string | undefined;
-    if (Object.hasOwn(LEGACY_VARIANTS, selected)) variant = LEGACY_VARIANTS[selected];
-    else if (selected === "halloween" || selected === "winter") variant = `${selected}_${id}`;
-    if (!variant) return selected;
-    return soundTypes.find(t => t.id === id)?.seasonal?.[variant] ? variant : "default";
-}
-
-// A copy, so settings.use() sees the change
-function setOverride(id: string, o: SoundOverride) {
-    settings.store.overrides[id] = { ...o };
+// A toast that fails to show must never stop the upload, import or delete around it
+function toast(options: Parameters<typeof showToast>[0]) {
+    try {
+        showToast(options);
+    } catch (e) {
+        logger.warn("Failed to show a toast:", options, e);
+    }
 }
 
 function clip(s: string, max: number) {
@@ -93,11 +74,8 @@ function clip(s: string, max: number) {
     return s.slice(0, max - 1).replace(/[\ud800-\udbff]$/, "") + "…";
 }
 
-let healthCheckTimer: ReturnType<typeof setTimeout> | undefined;
-let migrationNoticeTimer: ReturnType<typeof setTimeout> | undefined;
 let running = false;
 let startupHealth: PatchHealth | null = null;
-const BROKEN_TOAST = "A Discord update broke CustomSounds. See its settings.";
 const HEALTH_MESSAGES: Partial<Record<PatchHealth, string>> = {
     "reverted": "A Discord update broke CustomSounds. Discord's own sounds play until the plugin is updated.",
     "init-throws": "A Discord update broke CustomSounds, and it may stop sounds from playing. Disable it until the plugin is updated.",
@@ -105,12 +83,14 @@ const HEALTH_MESSAGES: Partial<Record<PatchHealth, string>> = {
     "no-init": "A Discord update broke part of CustomSounds. Sound settings may not apply while a sound pack is active."
 };
 
+// Discord ships these misspelled copies of halloween_deafen and halloween_undeafen, they aren't new sounds
+const MISSPELLED_SOUNDS = ["halloween_defean", "halloween_undefean"];
 let reportedNewSounds = false;
 function reportNewSounds(req: SoundpackRequire) {
     if (reportedNewSounds || typeof req?.keys !== "function") return;
     reportedNewSounds = true;
     try {
-        const known = new Set(Object.keys(LEGACY_VARIANTS));
+        const known = new Set(MISSPELLED_SOUNDS);
         for (const t of soundTypes) {
             known.add(t.id);
             for (const id of Object.keys(t.seasonal ?? {})) known.add(id);
@@ -125,7 +105,7 @@ function reportNewSounds(req: SoundpackRequire) {
 let overridesGeneration = 0;
 const HASH_ID = /^[0-9a-f]{64}$/;
 type OverrideEntry = SoundOverride & { id: string; };
-const soundName = (id: string) => soundTypes.find(t => t.id === id)?.name ?? id;
+const soundName = (id: string) => soundsById.get(id)?.name ?? wordsToTitle(wordsFromSnake(id));
 const withFileName = (sound: string, file?: string) => file ? `${sound} ("${file}")` : sound;
 let importing = 0;
 let exporting = false;
@@ -135,8 +115,9 @@ let deletingAll = false;
 let checkingDeleteAll = false;
 const DELETE_BUSY = "Wait for the audio to finish deleting";
 
-// Vencord's chooseFile() only returns one file and never resolves when the picker is cancelled
-function chooseFiles(accept: string) {
+// Vencord's chooseFile() removes its input while the dialog is still open, which can lose the picked file, and never
+// resolves when the picker is cancelled. This one keeps the input until the dialog closes
+function chooseFiles(accept: string, multiple = true) {
     return new Promise<File[]>(resolve => {
         const input = document.createElement("input");
         const done = (files: File[]) => {
@@ -144,7 +125,7 @@ function chooseFiles(accept: string) {
             resolve(files);
         };
         input.type = "file";
-        input.multiple = true;
+        input.multiple = multiple;
         input.accept = accept;
         input.style.display = "none";
         input.onchange = () => done([...input.files ?? []]);
@@ -154,42 +135,16 @@ function chooseFiles(accept: string) {
     });
 }
 
-// "quiet" skips the settings store, otherwise Vencord sees newer local settings on startup and skips the cloud sync
-function backfillFileNames(stored: Record<string, string>, quiet = false) {
-    if (importing) return;
-    try {
-        const found: Record<string, SoundOverride> = {};
-        for (const [id, o] of Object.entries(settings.plain.overrides ?? {})) {
-            if (typeof o?.selectedFileId !== "string" || cleanName(o.selectedFileName)) continue;
-            const local = Object.hasOwn(stored, o.selectedFileId) ? stored[o.selectedFileId] : undefined;
-            const name = cleanName(local) ?? cleanName(legacyNames.get(o.selectedFileId));
-            if (name) found[id] = { ...o, selectedFileName: name };
-        }
-        if (!Object.keys(found).length) return;
-        if (quiet) {
-            Object.assign(settings.plain.overrides, found);
-            VencordNative.settings.set(SettingsStore.plain).catch(e => logger.warn("Failed to add file names to older sound settings:", e));
-        } else {
-            settings.store.overrides = { ...settings.plain.overrides, ...found };
-        }
-    } catch (e) {
-        logger.warn("Failed to add file names to older sound settings:", e);
-    }
-}
-
 async function loadCustom(id: string): Promise<string | null> {
     try {
-        if (!await loadFileUrl(id)) await migrateLegacy();
         const url = await loadFileUrl(id);
         if (url) return url;
 
-        if (unmoved.has(id)) showToast({ text: "This sound's file couldn't be moved. Check console.", variant: "critical" });
-        else if (id === EMPTY_SHA256) showToast({ text: "This sound's file is empty. Pick or upload another." });
-        else showToast({ text: "This sound's file isn't on this device. Upload it again." });
+        toast({ text: "This sound's file isn't on this device. Upload it again." });
         return null;
     } catch (e) {
         logger.error("Failed to load a custom sound file:", e);
-        showToast({ text: "Failed to load this sound's file. Check console.", variant: "critical" });
+        toast({ text: "Failed to load this sound's file. Check console.", variant: "critical" });
         return null;
     }
 }
@@ -224,7 +179,7 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange }: {
     const save = (patch: Partial<SoundOverride>) => {
         if (patch.selectedFileId || ("selectedSound" in patch && patch.selectedSound !== getOverride(type.id).selectedSound)) switchToNativeLater.delete(type.id);
         const next = { ...getOverride(type.id), ...patch };
-        setOverride(type.id, next);
+        settings.store.overrides[type.id] = next;
         const fileChanged = "selectedFileId" in patch || "selectedSound" in patch || "enabled" in patch;
         if (fileChanged && next.enabled && next.selectedSound === "custom" && next.selectedFileId)
             loadCustom(next.selectedFileId);
@@ -236,11 +191,6 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange }: {
     const previewSound = async () => {
         const token = ++previewToken.current;
         sound.current?.stop();
-        if (!override.enabled) {
-            sound.current = playNative();
-            return;
-        }
-
         const { selectedSound, volume, selectedFileId } = override;
         if (selectedSound === "custom") {
             if (!selectedFileId) {
@@ -258,19 +208,20 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange }: {
     };
 
     const uploadFile = async () => {
-        let file = await chooseFile(ACCEPTED_AUDIO);
+        const [file] = await chooseFiles(ACCEPTED_AUDIO, false);
         if (!file) return;
-        if (deletingAll || checkingDeleteAll) return showToast({ text: DELETE_BUSY });
-        if (!file.size) return showToast({ text: "Upload failed: file is empty", variant: "critical" });
-        if (file.size > MAX_FILE_BYTES) return showToast({ text: "Upload failed: file is too large (max 50 MB)", variant: "critical" });
-        file = new File([file], file.name, { type: mimeFor(file.name, file.type) });
+        logger.info(`Upload: picked "${file.name}" (${file.size} bytes)`);
+        if (deletingAll || checkingDeleteAll) return toast({ text: DELETE_BUSY });
+        if (!file.size) return toast({ text: "Upload failed: file is empty", variant: "critical" });
+        if (file.size > MAX_FILE_BYTES) return toast({ text: "Upload failed: file is too large (max 50 MB)", variant: "critical" });
         cardUploads++;
         try {
-            showToast({ text: "Uploading file..." });
+            toast({ text: "Uploading file..." });
             const generation = overridesGeneration;
             const token = ++uploadToken.current;
             const before = getOverride(type.id);
             const added = await addFile(file);
+            logger.info(`Upload: saved "${file.name}"${added.existingName ? " (already uploaded)" : ""}`);
             const current = getOverride(type.id);
             const selected = generation === overridesGeneration && token === uploadToken.current
                 && current.selectedSound === before.selectedSound && current.selectedFileId === before.selectedFileId;
@@ -279,14 +230,14 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange }: {
             await onFilesChange();
 
             const url = await loadFileUrl(added.id).catch(() => null);
-            if (url && !await canDecode(url)) return showToast({ text: "Uploaded, but Discord can't play it. Use MP3 or OGG.", variant: "critical", duration: 8000 });
+            if (url && !await canDecode(url)) return toast({ text: "Uploaded, but Discord can't play it. Use MP3 or OGG.", variant: "critical", duration: 8000 });
 
-            if (!selected || generation !== overridesGeneration) showToast({ text: "Uploaded, but settings changed so it wasn't selected", variant: "success" });
-            else if (added.existingName) showToast({ text: "Already uploaded, using the existing file", variant: "success" });
-            else showToast({ text: "File uploaded", variant: "success" });
+            if (!selected || generation !== overridesGeneration) toast({ text: "Uploaded, but settings changed so it wasn't selected", variant: "success" });
+            else if (added.existingName) toast({ text: "Already uploaded, using the existing file", variant: "success" });
+            else toast({ text: "File uploaded", variant: "success" });
         } catch (e) {
             logger.error("Upload failed:", e);
-            showToast({ text: "Upload failed. Check console.", variant: "critical" });
+            toast({ text: "Upload failed. Check console.", variant: "critical" });
         } finally {
             cardUploads--;
         }
@@ -294,14 +245,13 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange }: {
 
     const deleteFile = async (id: string) => {
         try {
-            await forgetLegacy(id);
             await removeFile(id);
             handleFileDeleted(new Set([id]));
             await onFilesChange();
-            showToast({ text: "File deleted", variant: "success" });
+            toast({ text: "File deleted", variant: "success" });
         } catch (e) {
             logger.error("Delete failed:", e);
-            showToast({ text: "Delete failed. Check console.", variant: "critical" });
+            toast({ text: "Delete failed. Check console.", variant: "critical" });
         }
     };
 
@@ -318,37 +268,21 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange }: {
 
     const onFileSelect = (id: string) => {
         if (!id && !filesLoaded) return;
-        let selectedFileName: string | undefined;
-        if (Object.hasOwn(files, id)) selectedFileName = cleanName(files[id]);
-        else if (id) selectedFileName = override.selectedFileName;
+        const selectedFileName = Object.hasOwn(files, id) ? cleanName(files[id]) : id ? override.selectedFileName : undefined;
         save({ selectedFileId: id || undefined, selectedFileName });
     };
 
     const fileMissing = filesLoaded && override.selectedSound === "custom" && !!override.selectedFileId && !Object.hasOwn(files, override.selectedFileId);
     const fileOpts = Object.entries(files).map(([id, name]) => ({ value: id, label: name }));
     const lost = override.selectedFileName;
-    const missing = {
-        label: lost ? `Not on this device: "${clip(lost, 60)}"` : "File not on this device",
-        text: `${lost ? `"${lost}" isn't` : "This file isn't"} on this device. Until you upload it again or import a backup with it, Discord plays its own sound.`,
-        warn: false
-    };
-    if (override.selectedFileId === EMPTY_SHA256) {
-        missing.label = "Empty file";
-        missing.text = "An older version saved this file empty. Until you pick or upload another file, Discord plays its own sound.";
-    }
-    if (fileMissing && unmoved.has(override.selectedFileId!)) {
-        missing.label = "File couldn't be moved";
-        const fileName = lost ? ` "${lost}"` : "";
-        missing.text = `This sound's file${fileName} couldn't be moved from the old storage, so Discord plays its own sound. `
-            + "Restart to retry or upload the same file again, and don't clear Discord's data. Check console.";
-        missing.warn = true;
-    }
-    if (fileMissing) fileOpts.unshift({ value: override.selectedFileId!, label: missing.label });
+    const missingLabel = lost ? `Not on this device: "${clip(lost, 60)}"` : "File not on this device";
+    const missingText = `${lost ? `"${lost}" isn't` : "This file isn't"} on this device. Until you upload it again or import a backup with it, Discord plays its own sound.`;
+    if (fileMissing) fileOpts.unshift({ value: override.selectedFileId!, label: missingLabel });
 
     const sourceOpts = [
         { value: "default", label: "Native" },
         { value: "regular", label: "Regular" },
-        ...Object.keys(type.seasonal ?? {}).map(id => ({ value: id, label: soundTypes.find(t => t.id === id)?.name ?? wordsToTitle(wordsFromSnake(id)) })),
+        ...Object.keys(type.seasonal ?? {}).map(id => ({ value: id, label: soundName(id) })),
         { value: "custom", label: "Custom" }
     ];
     const sourceHint = override.enabled ? describeSource(type.id, override.selectedSound) : null;
@@ -395,10 +329,7 @@ function SoundCard({ type, override, files, filesLoaded, onFilesChange }: {
                             options={[{ value: "", label: filesLoaded ? "Select a file..." : "Loading files..." }, ...fileOpts]}
                             select={onFileSelect}
                         />
-                        {fileMissing && (missing.warn
-                            ? <Card variant="warning" defaultPadding className={Margins.top8}><Paragraph>{missing.text}</Paragraph></Card>
-                            : <Paragraph className={classes(Margins.top8, cl("muted"))} defaultColor={false}>{missing.text}</Paragraph>
-                        )}
+                        {fileMissing && <Paragraph className={classes(Margins.top8, cl("muted"))} defaultColor={false}>{missingText}</Paragraph>}
                     </div>
                     <Flex gap="8px" className={Margins.bottom16}>
                         <Button variant="primary" onClick={uploadFile}>Upload Audio</Button>
@@ -462,24 +393,22 @@ function MoreIcon() {
 
 function SettingsUI() {
     settings.use(["overrides"]);
-    migrateLegacySettings();
     const [remountKey, setRemountKey] = useState(0);
     const [files, setFiles] = useState<Record<string, string> | null>(null);
     const [query, setQuery] = useState("");
     const [health] = useState<PatchHealth | null>(() => running ? probePatched() ?? startupHealth : null);
 
-    const loadFiles = useCallback(async () => {
+    const loadFiles = async () => {
         try {
-            await migrateLegacy();
             const listed = await listFiles();
             setFiles(listed);
-            backfillFileNames(listed);
+            logger.info(`File list: ${pluralise(Object.keys(listed).length, "file")}`);
         } catch (e) {
             logger.error("Failed to load the audio file list:", e);
             setFiles({});
-            showToast({ text: "Failed to load your sound files. Check console.", variant: "critical" });
+            toast({ text: "Failed to load your sound files. Check console.", variant: "critical" });
         }
-    }, []);
+    };
 
     useEffect(() => {
         openSettingsViews++;
@@ -500,7 +429,7 @@ function SettingsUI() {
                 settings.store.overrides = {};
                 switchToNativeLater.clear();
                 setRemountKey(k => k + 1);
-                showToast({ text: "All sound settings reset", variant: "success" });
+                toast({ text: "All sound settings reset", variant: "success" });
             }}
         />
     ));
@@ -524,25 +453,27 @@ function SettingsUI() {
                         switchToNativeLater.delete(id);
                     }
                     settings.store.overrides = next;
-                    showToast({ text: `${clip(name, 26)} sound pack applied to ${pluralise(count, "sound")}`, variant: "success" });
+                    toast({ text: `${clip(name, 26)} sound pack applied to ${pluralise(count, "sound")}`, variant: "success" });
                 }}
             />
         ));
     };
 
     const uploadFiles = async () => {
-        if (uploadingFiles) return showToast({ text: "Already uploading, please wait" });
+        if (uploadingFiles) return toast({ text: "Already uploading, please wait" });
         const picked = await chooseFiles(ACCEPTED_AUDIO);
         if (!picked.length) return;
-        if (deletingAll || checkingDeleteAll) return showToast({ text: DELETE_BUSY });
-        if (uploadingFiles) return showToast({ text: "Already uploading, please wait" });
+        if (deletingAll || checkingDeleteAll) return toast({ text: DELETE_BUSY });
+        if (uploadingFiles) return toast({ text: "Already uploading, please wait" });
 
         uploadingFiles = true;
         let uploaded = 0;
         const existing: string[] = [];
         const skipped: string[] = [];
+        const unplayable: string[] = [];
         try {
-            showToast({ text: `Uploading ${pluralise(picked.length, "file")}...` });
+            logger.info(`Upload: picked ${picked.map(f => `"${f.name}" (${f.size} bytes)`).join(", ")}`);
+            toast({ text: `Uploading ${pluralise(picked.length, "file")}...` });
             // One at a time, so a big selection never holds every file in memory at once
             for (const chosen of picked) {
                 if (!chosen.size || chosen.size > MAX_FILE_BYTES) {
@@ -550,15 +481,13 @@ function SettingsUI() {
                     continue;
                 }
                 try {
-                    const probe = URL.createObjectURL(chosen);
-                    const playable = await canDecode(probe).finally(() => URL.revokeObjectURL(probe));
-                    if (!playable) {
-                        skipped.push(`${chosen.name} (Discord can't play it, use MP3 or OGG)`);
-                        continue;
-                    }
-                    const added = await addFile(new File([chosen], chosen.name, { type: mimeFor(chosen.name, chosen.type) }));
+                    const added = await addFile(chosen);
+                    logger.info(`Upload: saved "${chosen.name}"${added.existingName ? " (already uploaded)" : ""}`);
                     uploaded++;
                     if (added.existingName) existing.push(chosen.name);
+                    // Checked after saving, so a wrong guess about the format never loses the file
+                    const probe = URL.createObjectURL(chosen);
+                    if (!await canDecode(probe).finally(() => URL.revokeObjectURL(probe))) unplayable.push(chosen.name);
                 } catch (e) {
                     logger.error(`Upload failed for "${chosen.name}":`, e);
                     skipped.push(`${chosen.name} (failed)`);
@@ -569,34 +498,37 @@ function SettingsUI() {
             uploadingFiles = false;
         }
 
-        if (existing.length) logger.info(`Upload: these files were already uploaded: ${existing.join(", ")}`);
         if (skipped.length) logger.warn(`Upload: skipped ${skipped.join(", ")}`);
-        if (!uploaded) return showToast({ text: `Couldn't upload ${pluralise(skipped.length, "file")}. Check console.`, variant: "critical", duration: 8000 });
+        if (unplayable.length) logger.warn(`Upload: Discord can't play ${unplayable.join(", ")}. Use MP3 or OGG`);
+        if (!uploaded) return toast({ text: `Couldn't upload ${pluralise(skipped.length, "file")}. Check console.`, variant: "critical", duration: 8000 });
         const added = uploaded - existing.length;
-        let text = added ? `Uploaded ${pluralise(added, "file")}` : skipped.length ? `${pluralise(existing.length, "file")} already uploaded`
+        const problems = [skipped.length && `${skipped.length} skipped`, unplayable.length && `${unplayable.length} unplayable`].filter(Boolean).join(", ");
+        // Toasts show about 58 characters, so the already uploaded count is only in the console when something went wrong
+        let text = added ? `Uploaded ${pluralise(added, "file")}` : problems ? "No new files"
             : existing.length === 1 ? "This file was already uploaded" : `These ${existing.length} files were already uploaded`;
-        if (added && existing.length && !skipped.length) text += `, ${existing.length} already uploaded`;
-        if (skipped.length) showToast({ text: `${text}, ${skipped.length} skipped. Check console.`, variant: "critical", duration: 8000 });
-        else showToast({ text, variant: "success" });
+        if (added && existing.length && !problems) text += `, ${existing.length} already uploaded`;
+        if (problems) {
+            toast({ text: `${text}, ${problems}. Check console.`, variant: "critical", duration: 8000 });
+        } else {
+            toast({ text: `${text}. Pick under Custom`, variant: "success", duration: 6000 });
+        }
     };
 
     const busy = () => importing || exporting || uploadingFiles || cardUploads > 0;
     const BUSY = "Wait for the import, export or upload to finish";
 
     const deleteAllFiles = async () => {
-        if (deletingAll || checkingDeleteAll) return showToast({ text: "Already deleting, please wait" });
-        if (busy()) return showToast({ text: BUSY });
+        if (deletingAll || checkingDeleteAll) return toast({ text: "Already deleting, please wait" });
+        if (busy()) return toast({ text: BUSY });
 
         let count: number;
         checkingDeleteAll = true;
         try {
-            // Wait for the startup migration, or files it hasn't copied yet would be left out of the count
-            await migrateLegacy();
-            count = new Set([...Object.keys(await listFiles()), ...unmoved]).size;
-            if (!count && !await hasLegacy()) return showToast({ text: "No uploaded audio to delete" });
+            count = Object.keys(await listFiles()).length;
+            if (!count) return toast({ text: "No uploaded audio to delete" });
         } catch (e) {
             logger.error("Delete all failed:", e);
-            return showToast({ text: "Delete failed. Check console.", variant: "critical" });
+            return toast({ text: "Delete failed. Check console.", variant: "critical" });
         } finally {
             checkingDeleteAll = false;
         }
@@ -605,41 +537,26 @@ function SettingsUI() {
             <ConfirmModal
                 {...props}
                 title="Delete all uploaded audio?"
-                subtitle={`This deletes ${count ? pluralise(count, "uploaded audio file") : "the old sound storage"} from this device and can't be undone, so use Export backup first if you want a copy. `
+                subtitle={`This deletes ${pluralise(count, "uploaded audio file")} from this device and can't be undone, so use Export backup first if you want a copy. `
                     + "Sounds that use this audio switch to Native when you close these settings. With settings sync on, they switch on your other devices too, but the audio stored there isn't deleted."}
                 confirmText="Delete All"
                 onConfirm={async () => {
-                    if (deletingAll) return showToast({ text: "Already deleting, please wait" });
-                    if (busy()) return showToast({ text: BUSY });
+                    if (deletingAll) return toast({ text: "Already deleting, please wait" });
+                    if (busy()) return toast({ text: BUSY });
                     deletingAll = true;
                     // Stops an upload that's still finishing from selecting a file that's about to be deleted
                     overridesGeneration++;
-                    const deleted = new Set<string>();
                     let ok = true;
                     try {
-                        try {
-                            for (const id of await clearLegacy()) deleted.add(id);
-                            clearTimeout(migrationNoticeTimer);
-                            for (const id of await removeAllFiles()) deleted.add(id);
-                        } catch (e) {
-                            ok = false;
-                            logger.error("Delete all failed:", e);
-                            const left = await listFiles().catch(() => null);
-                            if (!left) deleted.clear();
-                            else for (const id of Object.keys(left)) deleted.delete(id);
-                        }
-                        try {
-                            if (deleted.size) handleFileDeleted(deleted);
-                        } catch (e) {
-                            ok = false;
-                            logger.error("Delete all failed:", e);
-                        }
+                        handleFileDeleted(new Set(await removeAllFiles()));
+                    } catch (e) {
+                        ok = false;
+                        logger.error("Delete all failed:", e);
                     } finally {
                         deletingAll = false;
                     }
                     await loadFiles();
-                    if (ok) showToast({ text: "All uploaded audio deleted", variant: "success" });
-                    else showToast({ text: "Delete failed. Check console.", variant: "critical" });
+                    toast(ok ? { text: "All uploaded audio deleted", variant: "success" } : { text: "Delete failed. Check console.", variant: "critical" });
                 }}
             />
         ));
@@ -654,20 +571,15 @@ function SettingsUI() {
     ) => {
         importing++;
         try {
-            let gen = overridesGeneration;
-            let before = "";
+            const gen = applyOverrides ? ++overridesGeneration : overridesGeneration;
+            const before = applyOverrides ? JSON.stringify(settings.store.overrides ?? {}) : "";
             const hadSettings = hasSoundSettings();
-            if (applyOverrides) {
-                gen = ++overridesGeneration;
-                before = JSON.stringify(settings.store.overrides ?? {});
-            }
 
             const storedBefore = await listFiles();
             const { remap, imported, skipped, ids } = await importAudioFiles(fileEntries);
             const newFiles = ids.filter(id => !Object.hasOwn(storedBefore, id)).length;
-            if (allInvalid && !imported) return showToast({ text: "Import failed: no CustomSounds data in this file", variant: "critical" });
+            if (allInvalid && !imported) return toast({ text: "Import failed: no CustomSounds data in this file", variant: "critical" });
 
-            const moved = await migrateLegacy();
             const available = await listFiles();
             setFiles(available);
 
@@ -699,7 +611,7 @@ function SettingsUI() {
                         o.selectedFileId = current.selectedFileId;
                         o.selectedFileName = current.selectedFileName;
                         keptCurrent.push(soundName(s.id));
-                    } else if ((HASH_ID.test(fileId) && fileId !== EMPTY_SHA256) || !moved) {
+                    } else if (HASH_ID.test(fileId)) {
                         if (s.selectedSound === "custom") awaitingFile.push(withFileName(soundName(s.id), o.selectedFileName));
                     } else {
                         o.selectedFileId = undefined;
@@ -709,29 +621,26 @@ function SettingsUI() {
                         }
                     }
                 }
-                const localName = o.selectedFileId && Object.hasOwn(available, o.selectedFileId) ? cleanName(available[o.selectedFileId]) : undefined;
-                o.selectedFileName = o.selectedFileId ? localName ?? o.selectedFileName : undefined;
+                o.selectedFileName = o.selectedFileId ? cleanName(available[o.selectedFileId]) ?? o.selectedFileName : undefined;
                 if (o.enabled && o.volume > DEFAULT_VOLUME) boosted++;
                 next[s.id] = o;
                 if (o.enabled && o.selectedSound === "custom" && o.selectedFileId) toLoad.add(o.selectedFileId);
             }
             Promise.all([...toLoad].map(loadFileUrl)).catch(e => logger.warn("Failed to preload the imported sounds:", e));
 
-            let applied = false;
             if (applyOverrides) {
                 if (gen !== overridesGeneration || JSON.stringify(settings.store.overrides ?? {}) !== before)
-                    return showToast({ text: imported ? "Files imported, but settings changed. Import again." : "Settings changed during the import. Import again.", duration: 8000 });
+                    return toast({ text: imported ? "Files imported, but settings changed. Import again." : "Settings changed during the import. Import again.", duration: 8000 });
                 overridesGeneration++;
                 settings.store.overrides = next;
                 switchToNativeLater.clear();
                 setRemountKey(k => k + 1);
-                applied = true;
             }
 
             const needsFiles = awaitingFile.length > 0 || switchedToNative.length > 0;
-            const filesOnly = !applied || (!sanitized.length && !hadSettings);
+            const filesOnly = !applyOverrides || (!sanitized.length && !hadSettings);
             if (filesOnly && !imported) {
-                showToast(skipped
+                toast(skipped
                     ? { text: `Couldn't import ${pluralise(skipped, "file")}. Check console.`, variant: "critical", duration: 8000 }
                     : { text: "Nothing to import in this backup" });
                 return;
@@ -744,8 +653,8 @@ function SettingsUI() {
             else if (newFiles) text = `Imported ${pluralise(sanitized.length, "setting")} and ${pluralise(newFiles, "new file")}`;
             else text = `Imported ${pluralise(sanitized.length, "setting")}`;
             if (skipped) text += ` (${pluralise(skipped, "file")} failed)`;
-            showToast({ text, variant: skipped || needsFiles ? "default" : "success", duration: needsFiles ? 8000 : undefined });
-            if (applied && boosted) showToast({ text: `${pluralise(boosted, "imported sound")} set above ${DEFAULT_VOLUME}%` });
+            toast({ text, variant: skipped || needsFiles ? "default" : "success", duration: needsFiles ? 8000 : undefined });
+            if (applyOverrides && boosted) toast({ text: `${pluralise(boosted, "imported sound")} set above ${DEFAULT_VOLUME}%` });
 
             const lines: string[] = [];
             if (noAudio && needsFiles) lines.push("This backup is from an older CustomSounds version or from Equicord, so it has no audio files.");
@@ -753,7 +662,7 @@ function SettingsUI() {
             if (keptCurrent.length) lines.push(`Kept your current file because the backup's file isn't on this device: ${keptCurrent.join(", ")}.`);
             if (switchedToNative.length) lines.push(`${switchedToNative.length === 1 ? "This sound lost its file and now uses" : "These sounds lost their file and now use"} Native: ${switchedToNative.join(", ")}.`);
             if (needsFiles) lines.push("After uploading the missing files, use Export backup again so your backup includes the audio.");
-            if (applied && lines.length) openModal(props => (
+            if (applyOverrides && lines.length) openModal(props => (
                 <Modal
                     {...props}
                     title={needsFiles ? "Some sounds need their audio files" : "Import notes"}
@@ -764,21 +673,21 @@ function SettingsUI() {
             ));
         } catch (e) {
             logger.error("Import failed:", e);
-            showToast({ text: `Import failed: ${e instanceof Error ? e.message : "check console"}`, variant: "critical" });
+            toast({ text: `Import failed: ${e instanceof Error ? e.message : "check console"}`, variant: "critical" });
         } finally {
             endImport();
         }
     };
 
     const handleSettingsUpload = async () => {
-        const file = importing ? null : await chooseFile("application/json,.json");
-        if (importing) return showToast({ text: "Already importing, please wait" });
+        const file = importing ? null : (await chooseFiles("application/json,.json", false))[0];
+        if (importing) return toast({ text: "Already importing, please wait" });
         if (!file) return;
-        if (deletingAll || checkingDeleteAll) return showToast({ text: DELETE_BUSY });
+        if (deletingAll || checkingDeleteAll) return toast({ text: DELETE_BUSY });
         importing++;
         try {
-            if (file.size > MAX_BACKUP_BYTES) return showToast({ text: "Import failed: file is too large (max 500 MB)", variant: "critical" });
-            showToast({ text: "Importing..." });
+            if (file.size > MAX_BACKUP_BYTES) return toast({ text: "Import failed: file is too large (max 500 MB)", variant: "critical" });
+            toast({ text: "Importing..." });
             const json = await file.text();
             let imp: any;
             try {
@@ -795,27 +704,21 @@ function SettingsUI() {
 
             const fileEntries = (importedFiles ?? []).filter((fd): fd is Partial<ExportedAudioFile> => !!fd && typeof fd === "object");
             const entryNames = new Map(fileEntries.map(fd => [fd.id, fd.name]));
-            const soundsById = new Map(soundTypes.map(t => [t.id, t]));
             const sanitizedById = new Map<string, OverrideEntry>();
             for (const raw of importedOverrides ?? []) {
                 const s = raw as Partial<SoundOverride> & { id?: unknown; };
-                if (!s || typeof s !== "object" || typeof s.id !== "string") continue;
-                const t = soundsById.get(s.id);
-                if (!t) continue;
+                if (!s || typeof s !== "object" || typeof s.id !== "string" || !soundsById.has(s.id)) continue;
                 const o = normalizeOverride({ ...s, selectedFileName: cleanName(s.selectedFileName) ?? entryNames.get(s.selectedFileId) });
-                o.selectedSound = resolveLegacySeason(s.id, o.selectedSound);
-                const validSounds = new Set(["default", "regular", "custom", ...Object.keys(t.seasonal ?? {})]);
-                if (!validSounds.has(o.selectedSound)) o.selectedSound = "default";
+                if (!isSource(s.id, o.selectedSound)) o.selectedSound = "default";
                 sanitizedById.set(s.id, { ...o, id: s.id });
             }
             const sanitized = [...sanitizedById.values()];
 
-            if (importedOverrides && importedOverrides.length > 0 && sanitized.length === 0 && fileEntries.length === 0)
-                throw new Error("no CustomSounds data in this file");
+            const allInvalid = !!importedOverrides?.length && !sanitized.length;
+            if (allInvalid && !fileEntries.length) throw new Error("no CustomSounds data in this file");
 
-            const applyOverrides = !!importedOverrides && (sanitized.length > 0 || importedOverrides.length === 0);
+            const applyOverrides = !!importedOverrides && !allInvalid;
             const noAudio = !importedFiles && sanitized.some(s => s.selectedSound === "custom" && !!s.selectedFileId);
-            const allInvalid = !!importedOverrides && importedOverrides.length > 0 && sanitized.length === 0;
 
             const run = () => applyImport(sanitized, fileEntries, applyOverrides, noAudio, allInvalid);
             if (applyOverrides && hasSoundSettings()) {
@@ -835,9 +738,9 @@ function SettingsUI() {
                         confirmText="Import"
                         variant="primary"
                         onConfirm={() => {
-                            if (importing) return showToast({ text: "Already importing, please wait" });
-                            if (deletingAll || checkingDeleteAll) return showToast({ text: DELETE_BUSY });
-                            showToast({ text: "Importing..." });
+                            if (importing) return toast({ text: "Already importing, please wait" });
+                            if (deletingAll || checkingDeleteAll) return toast({ text: DELETE_BUSY });
+                            toast({ text: "Importing..." });
                             void run();
                         }}
                     />
@@ -847,19 +750,19 @@ function SettingsUI() {
             }
         } catch (e) {
             logger.error("Import failed:", e);
-            showToast({ text: `Import failed: ${e instanceof Error ? e.message : "check console"}`, variant: "critical" });
+            toast({ text: `Import failed: ${e instanceof Error ? e.message : "check console"}`, variant: "critical" });
         } finally {
             endImport();
         }
     };
 
     const downloadSettings = async () => {
-        if (exporting) return showToast({ text: "Already exporting, please wait" });
-        if (deletingAll) return showToast({ text: DELETE_BUSY });
+        if (exporting) return toast({ text: "Already exporting, please wait" });
+        if (deletingAll) return toast({ text: DELETE_BUSY });
         exporting = true;
         const saved: string[] = [];
         try {
-            showToast({ text: "Exporting..." });
+            toast({ text: "Exporting..." });
             const overrides = soundTypes
                 .map(t => {
                     const o = getOverride(t.id);
@@ -870,24 +773,21 @@ function SettingsUI() {
                         enabled: o.enabled,
                         selectedSound,
                         selectedFileId: fileId,
-                        selectedFileName: fileId && (o.selectedFileName ?? (files && Object.hasOwn(files, fileId) ? cleanName(files[fileId]) : undefined)),
+                        selectedFileName: fileId && (o.selectedFileName ?? cleanName(files?.[fileId])),
                         volume: o.volume
                     };
                 })
                 .filter(o => o.enabled || o.selectedSound !== "default" || o.volume !== DEFAULT_VOLUME);
             const used = overrides.filter(o => o.selectedSound === "custom" && o.selectedFileId).map(o => o.selectedFileId!);
-            const moved = await migrateLegacy();
-            const old = unmoved.size ? await legacyFiles(unmoved).catch(e => void logger.warn("Export: failed to read the old storage:", e)) : undefined;
             const exportedAt = new Date().toISOString();
 
-            let rest = [...used, ...unmoved, ...Object.keys(await listFiles())];
+            let rest = [...used, ...Object.keys(await listFiles())];
             const left: string[] = [];
-            const fromOld: string[] = [];
             let bundled = 0;
             let unbundled = 0;
             let base = "";
             do {
-                const part = await buildBackup(saved.length ? { format: 2, exportedAt } : { format: 2, exportedAt, overrides }, rest, old);
+                const part = await buildBackup(saved.length ? { format: 2, exportedAt } : { format: 2, exportedAt, overrides }, rest);
                 // Split backups have the export time in their names so parts of different exports don't get mixed up
                 base ||= `customSounds-backup-${exportedAt.slice(0, 10)}${part.rest.length ? "-" + exportedAt.slice(11, 16).replace(":", "") : ""}`;
                 // The first part holds the settings, so it's always saved. Later parts only if they got files
@@ -898,35 +798,27 @@ function SettingsUI() {
                 bundled += part.bundled;
                 unbundled += part.unbundled;
                 left.push(...part.left);
-                fromOld.push(...part.fromOld);
                 rest = part.rest;
             } while (rest.length);
 
             if (saved.length > 1)
                 logger.info(`Export: split the backup into ${saved.length} files, since one import holds at most 300 MB: ${saved.join(", ")}. Import the -part files first and ${saved[0]} last`);
-            if (fromOld.length)
-                logger.warn(`Export: these files couldn't be moved, so they were taken from the old storage: ${fromOld.join(", ")}. `
-                    + "Don't clear Discord's data. Restart to retry, or upload them again");
-            else if (!moved)
-                logger.warn("Export: moving the old storage failed, so files that are only there may be missing from the backup. Don't clear Discord's data");
             if (unbundled)
-                logger.warn(`Export: couldn't add the audio for ${pluralise(unbundled, "file")} (missing, empty or unreadable${moved ? "" : ", or still in the old storage"})`);
+                logger.warn(`Export: couldn't add the audio for ${pluralise(unbundled, "file")} (missing, empty or unreadable)`);
             if (left.length)
                 logger.warn(`Export: left out files over the 50 MB import limit, so keep the originals: ${left.join(", ")}`);
 
             const missed = unbundled + left.length;
-            const ok = !missed && moved;
             const split = saved.length > 1;
             let text: string;
             if (missed) text = split ? `Saved ${saved.length} files, but ${missed} couldn't be added. Check console.` : `Exported, but ${pluralise(missed, "file")} couldn't be added. Check console.`;
-            else if (!moved) text = split ? `Saved ${saved.length} files, but old ones weren't moved. Check console.` : "Exported, but old files weren't moved. Check console.";
             else if (split) text = `Saved ${saved.length} backup files. Check your downloads.`;
             else text = `Exported ${pluralise(overrides.length, "setting")} and ${pluralise(bundled, "file")}`;
-            showToast({ text, variant: ok ? "success" : "critical", duration: ok ? undefined : 8000 });
+            toast({ text, variant: missed ? "critical" : "success", duration: missed ? 8000 : undefined });
         } catch (e) {
             logger.error("Export failed:", e);
             if (saved.length) logger.error(`Export: these backup files are incomplete, export again: ${saved.join(", ")}`);
-            showToast({ text: saved.length ? "Export failed. Saved files are incomplete. Check console." : "Export failed. Check console.", variant: "critical" });
+            toast({ text: saved.length ? "Export failed. Saved files are incomplete. Check console." : "Export failed. Check console.", variant: "critical" });
         } finally {
             exporting = false;
         }
@@ -937,7 +829,7 @@ function SettingsUI() {
         ContextMenuApi.openContextMenu(e, () => (
             <Menu.Menu
                 navId="vc-customsounds-settings"
-                onClose={() => FluxDispatcher.dispatch({ type: "CONTEXT_MENU_CLOSE" })}
+                onClose={ContextMenuApi.closeContextMenu}
                 aria-label="CustomSounds options"
             >
                 {packs.length > 0 && (
@@ -1062,8 +954,8 @@ export default definePlugin({
         const original = canonical ? getOverride(canonical) : undefined;
         if (canonical && original?.enabled) {
             const s = original.selectedSound;
-            const ownPick = s === "custom" ? !!original.selectedFileId && !isAbsent(original.selectedFileId)
-                : s === "regular" || Object.hasOwn(soundTypes.find(t => t.id === canonical)?.seasonal ?? {}, s);
+            // getOverride turns a source this sound doesn't have into "default", so anything else is the user's pick
+            const ownPick = s === "custom" ? !!original.selectedFileId && !isAbsent(original.selectedFileId) : s !== "default";
             if (ownPick) return { ...original, id: canonical };
         }
         const mapped = getOverride(name);
@@ -1083,7 +975,6 @@ export default definePlugin({
 
     resolveSrc(player: AudioPlayer, req: SoundpackRequire, ext: string): string {
         const { name } = player;
-        ext ||= "mp3";
         player.__csDefaultSrc = undefined;
         if (isUrl(name)) return name;
         reportNewSounds(req);
@@ -1156,7 +1047,7 @@ export default definePlugin({
             // The startup sound is created before files are cached, so creating _audio here would lock in the default sound
             if (!player._audio) return true;
             player._audio
-                .then(audio => applyElementVolume(audio, pct, MediaEngineStore.getOutputVolume(), getPlayerSinkId(player), playerBaseVolume(player)))
+                .then(audio => applyElementVolume(player, audio, pct))
                 .catch(() => { });
             return true;
         } catch (e) {
@@ -1182,7 +1073,7 @@ export default definePlugin({
                 return true;
             }
             logger.warn(`Sound "${player.name}" failed to load and has no fallback. src: ${audio.currentSrc || audio.src}`);
-            if (player.__csPreviewVolume != null) showToast({ text: "Failed to load this sound", variant: "critical" });
+            if (player.__csPreviewVolume != null) toast({ text: "Failed to load this sound", variant: "critical" });
             return false;
         } catch (e) {
             logger.error("Failed to handle a sound load error:", e);
@@ -1191,58 +1082,38 @@ export default definePlugin({
     },
 
     async start() {
-        migrateLegacySettings();
         running = true;
         const healthDelays = [15000, 30000, 60000, 120000];
         let healthAttempt = 0;
         const runHealthCheck = () => {
-            const health = probePatched();
+            let health = probePatched();
             if (health === null) {
                 if (++healthAttempt < healthDelays.length) {
-                    healthCheckTimer = setTimeout(runHealthCheck, healthDelays[healthAttempt]);
+                    setTimeout(runHealthCheck, healthDelays[healthAttempt]);
                     return;
                 }
-                startupHealth = "reverted";
+                health = "reverted";
                 logger.warn("Failed to find Discord's sound class, so none of the patches applied");
-                showToast({ text: BROKEN_TOAST, variant: "critical", duration: 10000 });
-                return;
-            }
-            startupHealth = health;
-            if (health === "reverted") logger.warn("Patch group is inactive. Look for \"Undoing patch group\" in the startup logs to see which patch broke");
+            } else if (health === "reverted") logger.warn("Patch group is inactive. Look for \"Undoing patch group\" in the startup logs to see which patch broke");
             else if (health === "init-throws") logger.warn("Constructing WebAudioSound throws, so the constructor patch is broken");
             else if (health === "no-volume") logger.warn("The volume patch didn't apply, so volume overrides won't work");
             else if (health === "no-init") logger.warn("The constructor patch didn't apply, so overrides may not work while a sound pack is active");
-            if (HEALTH_MESSAGES[health]) showToast({ text: BROKEN_TOAST, variant: "critical", duration: 10000 });
+            startupHealth = health;
+            if (HEALTH_MESSAGES[health]) toast({ text: "A Discord update broke CustomSounds. See its settings.", variant: "critical", duration: 10000 });
         };
-        healthCheckTimer = setTimeout(runHealthCheck, healthDelays[0]);
-
-        const migrated = await migrateLegacy();
-        backfillFileNames({}, true);
+        // Vencord never stops a plugin with patches, it restarts Discord instead, so this timer and the file URLs need no cleanup
+        setTimeout(runHealthCheck, healthDelays[0]);
 
         const enabledCustom = soundTypes
             .map(t => ({ id: t.id, o: getOverride(t.id) }))
             .filter(({ o }) => o.enabled && o.selectedSound === "custom" && o.selectedFileId);
-        const wanted = [...new Set(enabledCustom.map(({ o }) => o.selectedFileId!))];
-        const loaded = await Promise.all(wanted.map(id => loadFileUrl(id).catch(e => logger.error("Failed to preload a custom sound:", e))));
+        await Promise.all([...new Set(enabledCustom.map(({ o }) => o.selectedFileId!))]
+            .map(id => loadFileUrl(id).catch(e => logger.error("Failed to preload a custom sound:", e))));
 
         const missingSounds = enabledCustom
-            .filter(({ o }) => loaded[wanted.indexOf(o.selectedFileId!)] === null && !unmoved.has(o.selectedFileId!))
-            .map(({ id, o }) => withFileName(soundName(id), o.selectedFileName ?? cleanName(legacyNames.get(o.selectedFileId!))));
+            .filter(({ o }) => isAbsent(o.selectedFileId!))
+            .map(({ id, o }) => withFileName(soundName(id), o.selectedFileName));
         if (missingSounds.length)
             logger.info(`No file on this device for ${pluralise(missingSounds.length, "sound")}, Discord plays its own sound instead:`, missingSounds.join(", "));
-        if (!migrated)
-            migrationNoticeTimer = setTimeout(async () => {
-                if (!await migrateLegacy())
-                    showToast({ text: "CustomSounds: files not moved. Don't clear Discord's data.", variant: "critical", duration: 10000 });
-            }, healthDelays[0]);
-    },
-
-    stop() {
-        running = false;
-        startupHealth = null;
-        clearTimeout(healthCheckTimer);
-        clearTimeout(migrationNoticeTimer);
-        // Vencord never calls stop() on plugins with patches, this is only here in case that changes
-        revokeFileUrls();
     }
 });
