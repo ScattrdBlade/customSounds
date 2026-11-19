@@ -46,7 +46,6 @@ function isSource(id: string, sound: string) {
         || Object.hasOwn(soundsById.get(id)?.seasonal ?? {}, sound);
 }
 
-// A source this sound doesn't have plays as Native
 function getOverride(id: string): SoundOverride {
     const o = normalizeOverride(settings.store.overrides?.[id]);
     if (!isSource(id, o.selectedSound)) o.selectedSound = "default";
@@ -60,7 +59,6 @@ function hasSoundSettings() {
     });
 }
 
-// A toast that fails to show must never stop the upload, import or delete around it
 function toast(options: Parameters<typeof showToast>[0]) {
     try {
         showToast(options);
@@ -396,6 +394,7 @@ function SettingsUI() {
     const [remountKey, setRemountKey] = useState(0);
     const [files, setFiles] = useState<Record<string, string> | null>(null);
     const [query, setQuery] = useState("");
+    const [orderedTypes] = useState(() => [...soundTypes].sort((a, b) => +getOverride(b.id).enabled - +getOverride(a.id).enabled));
     const [health] = useState<PatchHealth | null>(() => running ? probePatched() ?? startupHealth : null);
 
     const loadFiles = async () => {
@@ -485,7 +484,6 @@ function SettingsUI() {
                     logger.info(`Upload: saved "${chosen.name}"${added.existingName ? " (already uploaded)" : ""}`);
                     uploaded++;
                     if (added.existingName) existing.push(chosen.name);
-                    // Checked after saving, so a wrong guess about the format never loses the file
                     const probe = URL.createObjectURL(chosen);
                     if (!await canDecode(probe).finally(() => URL.revokeObjectURL(probe))) unplayable.push(chosen.name);
                 } catch (e) {
@@ -847,7 +845,7 @@ function SettingsUI() {
     };
 
     const q = query.trim().toLowerCase();
-    const shownTypes = q ? soundTypes.filter(t => t.name.toLowerCase().includes(q) || t.id.includes(q)) : soundTypes;
+    const shownTypes = q ? orderedTypes.filter(t => t.name.toLowerCase().includes(q) || t.id.includes(q)) : orderedTypes;
 
     return (
         <div>
@@ -954,7 +952,6 @@ export default definePlugin({
         const original = canonical ? getOverride(canonical) : undefined;
         if (canonical && original?.enabled) {
             const s = original.selectedSound;
-            // getOverride turns a source this sound doesn't have into "default", so anything else is the user's pick
             const ownPick = s === "custom" ? !!original.selectedFileId && !isAbsent(original.selectedFileId) : s !== "default";
             if (ownPick) return { ...original, id: canonical };
         }
@@ -1101,7 +1098,6 @@ export default definePlugin({
             startupHealth = health;
             if (HEALTH_MESSAGES[health]) toast({ text: "A Discord update broke CustomSounds. See its settings.", variant: "critical", duration: 10000 });
         };
-        // Vencord never stops a plugin with patches, it restarts Discord instead, so this timer and the file URLs need no cleanup
         setTimeout(runHealthCheck, healthDelays[0]);
 
         const enabledCustom = soundTypes

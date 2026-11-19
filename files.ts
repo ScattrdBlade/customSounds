@@ -42,7 +42,6 @@ export const hasAudio = (f: StoredFile | undefined): f is StoredFile => f?.blob 
 export const getFileUrl = (id: string) => urls.get(id);
 const fileKeys = async () => (await DataStore.keys()).filter((k): k is string => typeof k === "string" && k.startsWith(FILE_PREFIX));
 
-// Storage that never answers becomes an error, instead of an upload or file list that waits forever
 const STORAGE_TIMEOUT = 30_000;
 function withTimeout<T>(promise: Promise<T>, what: string) {
     let timer: ReturnType<typeof setTimeout>;
@@ -69,7 +68,6 @@ async function readFileList(): Promise<Record<string, string>> {
         .map(([id, f]) => [id, typeof f.name === "string" ? f.name : "Unknown"]));
 }
 
-// Every caller checks the size first, so files here are never empty or over MAX_FILE_BYTES
 export const addFile = (file: File) => withTimeout(storeFile(file), "Saving the file");
 
 async function storeFile(file: File): Promise<{ id: string; existingName?: string; }> {
@@ -87,7 +85,6 @@ async function storeFile(file: File): Promise<{ id: string; existingName?: strin
         addedAt: Date.now()
     } satisfies StoredFile);
     dropUrl(id);
-    // The file list only shows files that read back as audio, so a save that doesn't is an error, not a missing file
     const saved = await getFile(id);
     if (!hasAudio(saved) || saved.blob.size !== bytes.byteLength) {
         await DataStore.del(FILE_PREFIX + id);
